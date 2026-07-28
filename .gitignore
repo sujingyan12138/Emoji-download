@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+*.spec
+
+# Local outputs and user media must never enter the public repository.
+library/
+douyin_*.png
+douyin_*.gif
+douyin_*.webp
+douyin_*.jpg
+qq_*.png
+qq_*.gif
+qq_*.webp
+qq_*.jpg
+
+*.log
+*.tmp
+Thumbs.db
+.DS_Store

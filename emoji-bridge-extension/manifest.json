@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "表情中转站 Emoji Bridge",
+  "version": "0.2.0",
+  "description": "从抖音网页版识别并导出原始静态、动态表情，再迁移到微信或 QQ。",
+  "permissions": [
+    "downloads",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://www.douyin.com/*",
+    "https://*.douyinpic.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "打开表情中转站"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.douyin.com/*"
+      ],
+      "js": [
+        "core.js",
+        "content.js"
+      ],
+      "css": [
+        "styles.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
