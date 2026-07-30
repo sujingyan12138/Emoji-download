@@ -176,7 +176,7 @@
 }
 
 .eb-route__source,
-.eb-destination {
+.eb-route__target {
   border: 1.5px solid var(--eb-ink);
   border-radius: 9px 3px 9px 3px;
   min-height: 48px;
@@ -205,27 +205,17 @@
   font-weight: 900;
 }
 
-.eb-destination {
-  background: var(--eb-ink);
-  display: grid;
-  gap: 3px;
-  grid-template-columns: 1fr 1fr;
-  padding: 3px;
-}
-
-.eb-destination button {
-  background: transparent;
-  border: 0;
-  border-radius: 6px 2px 6px 2px;
-  color: var(--eb-paper);
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 800;
-}
-
-.eb-destination button.is-active {
+.eb-route__target {
   background: var(--eb-mint);
   color: var(--eb-ink);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 5px 10px;
+}
+
+.eb-route__target strong {
+  font-size: 13px;
 }
 
 .eb-actions {

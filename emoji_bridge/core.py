@@ -4,15 +4,14 @@ import ctypes
 import hashlib
 import json
 import os
-import re
 import shutil
-import subprocess
 import tempfile
 import zipfile
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Iterable, Iterator, Sequence
+from typing import Callable, Iterable, Iterator, Sequence
 
 from PIL import Image, UnidentifiedImageError
 
@@ -27,6 +26,8 @@ MEDIA_SUFFIXES = {
 }
 MAX_SCAN_FILES = 1200
 MAX_EXTENSION_ARCHIVE_BYTES = 50 * 1024 * 1024
+MAX_DRIVE_SCAN_DEPTH = 7
+MAX_DRIVE_SCAN_DIRS = 400
 
 
 @dataclass(frozen=True)
@@ -64,8 +65,8 @@ def _read_head(path: Path, length: int = 32) -> bytes:
 
 
 def _activity_time(stat: os.stat_result) -> float:
-    # On Windows QQ often preserves the source file's old mtime while the
-    # creation time records when the cache entry arrived on this computer.
+    # QQ often keeps the source mtime. On Windows ctime is the time the cache
+    # reached this computer, so the newer value is the useful activity signal.
     return max(stat.st_mtime, stat.st_ctime)
 
 
@@ -94,7 +95,7 @@ def detect_media(path: Path, platform: str = "") -> Asset:
         return Asset(
             platform=platform,
             path=path,
-            format="加密/未知",
+            format="未知",
             width=None,
             height=None,
             frames=0,
@@ -102,7 +103,7 @@ def detect_media(path: Path, platform: str = "") -> Asset:
             size=stat.st_size,
             modified=_activity_time(stat),
             readable=False,
-            note="文件不是可直接读取的图片；微信 4.x 缓存通常已加密。",
+            note="文件不是受支持的静态或动态图片，已跳过导出。",
         )
 
     width = height = None
@@ -113,8 +114,8 @@ def detect_media(path: Path, platform: str = "") -> Asset:
         with Image.open(path) as image:
             width, height = image.size
             frames = int(getattr(image, "n_frames", 1))
-            durations: list[int] = []
             if frames > 1:
+                durations: list[int] = []
                 for index in range(frames):
                     image.seek(index)
                     durations.append(int(image.info.get("duration", 0)))
@@ -138,37 +139,109 @@ def detect_media(path: Path, platform: str = "") -> Asset:
     )
 
 
-def _logical_drives() -> list[Path]:
+def list_local_drives() -> list[Path]:
+    """Return ready fixed/removable local disks that may contain QQ data."""
     if os.name != "nt":
         return [Path("/")]
+
     mask = ctypes.windll.kernel32.GetLogicalDrives()
-    drives = []
+    drives: list[Path] = []
     for index in range(26):
-        if mask & (1 << index):
-            drives.append(Path(f"{chr(65 + index)}:\\"))
+        if not mask & (1 << index):
+            continue
+        root = Path(f"{chr(65 + index)}:\\")
+        drive_type = ctypes.windll.kernel32.GetDriveTypeW(str(root))
+        if drive_type not in (2, 3):  # removable or fixed; skip network/CD/RAM
+            continue
+        try:
+            if root.is_dir():
+                drives.append(root)
+        except OSError:
+            continue
     return drives
 
 
-def _safe_children(path: Path) -> list[Path]:
+_SCAN_SKIP_NAMES = {
+    "$recycle.bin",
+    "system volume information",
+    "windows",
+    "program files",
+    "program files (x86)",
+    "programdata",
+    "node_modules",
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+}
+_SCAN_PRIORITY_PARTS = (
+    "qq",
+    "tencent",
+    "file",
+    "data",
+    "chat",
+    "user",
+    "document",
+    "消息",
+    "聊天",
+    "文件",
+    "数据",
+)
+
+
+def _safe_children(path: Path, *, prune: bool = False) -> list[Path]:
+    children: list[Path] = []
     try:
-        return [item for item in path.iterdir() if item.is_dir()]
+        entries = path.iterdir()
+        for item in entries:
+            try:
+                if prune and item.name.casefold() in _SCAN_SKIP_NAMES:
+                    continue
+                if not item.is_dir() or item.is_symlink():
+                    continue
+                is_junction = getattr(item, "is_junction", None)
+                if callable(is_junction) and is_junction():
+                    continue
+                children.append(item)
+            except (OSError, PermissionError):
+                continue
     except (OSError, PermissionError):
         return []
+    if prune:
+        children.sort(
+            key=lambda item: (
+                0
+                if any(part in item.name.casefold() for part in _SCAN_PRIORITY_PARTS)
+                else 1,
+                item.name.casefold(),
+            )
+        )
+    return children
 
 
-def _walk_dirs_limited(root: Path, max_depth: int, max_dirs: int = 3000) -> Iterator[Path]:
-    if not root.is_dir():
+def _walk_dirs_limited(
+    root: Path,
+    max_depth: int,
+    max_dirs: int = 3000,
+    *,
+    prune: bool = False,
+) -> Iterator[Path]:
+    try:
+        if not root.is_dir():
+            return
+    except OSError:
         return
-    queue: list[tuple[Path, int]] = [(root, 0)]
+
+    pending: deque[tuple[Path, int]] = deque([(root, 0)])
     visited = 0
-    while queue and visited < max_dirs:
-        current, depth = queue.pop(0)
+    while pending and visited < max_dirs:
+        current, depth = pending.popleft()
         visited += 1
         yield current
         if depth >= max_depth:
             continue
-        for child in _safe_children(current):
-            queue.append((child, depth + 1))
+        for child in _safe_children(current, prune=prune):
+            pending.append((child, depth + 1))
 
 
 def _latest_mtime(path: Path, max_files: int = 300) -> float:
@@ -178,12 +251,13 @@ def _latest_mtime(path: Path, max_files: int = 300) -> float:
         for item in path.rglob("*"):
             if seen >= max_files:
                 break
-            if item.is_file():
-                seen += 1
-                try:
-                    latest = max(latest, _activity_time(item.stat()))
-                except OSError:
-                    continue
+            if not item.is_file():
+                continue
+            seen += 1
+            try:
+                latest = max(latest, _activity_time(item.stat()))
+            except OSError:
+                continue
     except (OSError, PermissionError):
         return latest
     return latest
@@ -199,11 +273,18 @@ def _mask_account(name: str) -> str:
 def _dedupe_locations(locations: Iterable[Location]) -> list[Location]:
     result: dict[str, Location] = {}
     for item in locations:
-        key = os.path.normcase(str(item.media_root.resolve()))
+        try:
+            key = os.path.normcase(str(item.media_root.resolve()))
+        except OSError:
+            key = os.path.normcase(str(item.media_root))
         existing = result.get(key)
         if existing is None or item.last_activity > existing.last_activity:
             result[key] = item
     return sorted(result.values(), key=lambda item: item.last_activity, reverse=True)
+
+
+def _drive_name(path: Path) -> str:
+    return path.drive or path.name or str(path)
 
 
 def discover_qq_locations(
@@ -212,30 +293,67 @@ def discover_qq_locations(
     drives: Sequence[Path] | None = None,
     extra_roots: Sequence[Path] = (),
 ) -> list[Location]:
+    """Discover validated QQ NT accounts on every ready local disk.
+
+    Common QQ locations are searched first. Each disk then gets a bounded
+    structural scan for ``nt_qq/nt_data/Emoji`` so custom data folders are
+    supported without turning application startup into an unbounded crawl.
+    """
+
     user_home = home or Path.home()
-    drive_roots = list(drives) if drives is not None else _logical_drives()
+    drive_roots = list(drives) if drives is not None else list_local_drives()
     candidates: list[tuple[Path, str]] = []
-    standard_bases = [
-        user_home / "Documents" / "Tencent Files",
-        user_home / "Documents" / "QQ Files",
-        user_home / "AppData" / "Roaming" / "Tencent" / "QQ",
+    standard_bases: list[tuple[Path, str]] = [
+        (user_home / "Documents" / "Tencent Files", "用户目录"),
+        (user_home / "Documents" / "QQ Files", "用户目录"),
+        (user_home / "AppData" / "Roaming" / "Tencent" / "QQ", "用户目录"),
     ]
     for drive in drive_roots:
-        standard_bases.extend([drive / "Tencent Files", drive / "QQ Files"])
-    standard_bases.extend(extra_roots)
+        drive_name = _drive_name(drive)
+        standard_bases.extend(
+            [
+                (drive / "Tencent Files", f"{drive_name} 常见位置"),
+                (drive / "QQ Files", f"{drive_name} 常见位置"),
+            ]
+        )
+    standard_bases.extend((root, "手动位置") for root in extra_roots)
 
-    for base in standard_bases:
-        for folder in _walk_dirs_limited(base, max_depth=7):
+    def collect(
+        base: Path,
+        source: str,
+        *,
+        max_depth: int,
+        max_dirs: int,
+        prune: bool,
+    ) -> None:
+        for folder in _walk_dirs_limited(
+            base,
+            max_depth=max_depth,
+            max_dirs=max_dirs,
+            prune=prune,
+        ):
             if folder.name.casefold() != "emoji":
                 continue
             if folder.parent.name.casefold() != "nt_data":
                 continue
             if folder.parent.parent.name.casefold() != "nt_qq":
                 continue
-            account_root = folder.parent.parent.parent
-            candidates.append((folder, "自动发现"))
+            candidates.append((folder, source))
 
-    locations = []
+    for base, source in standard_bases:
+        collect(base, source, max_depth=7, max_dirs=4000, prune=False)
+
+    for drive in drive_roots:
+        drive_name = _drive_name(drive)
+        collect(
+            drive,
+            f"{drive_name} 盘扫描",
+            max_depth=MAX_DRIVE_SCAN_DEPTH,
+            max_dirs=MAX_DRIVE_SCAN_DIRS,
+            prune=True,
+        )
+
+    locations: list[Location] = []
     for media_root, source in candidates:
         account_root = media_root.parent.parent.parent
         locations.append(
@@ -248,130 +366,6 @@ def discover_qq_locations(
                 last_activity=_latest_mtime(media_root),
             )
         )
-    return _dedupe_locations(locations)
-
-
-def _extract_wechat_process_roots() -> list[Path]:
-    if os.name != "nt":
-        return []
-    script = (
-        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
-        "Get-CimInstance Win32_Process | "
-        "Where-Object {$_.Name -in @('Weixin.exe','WeChatAppEx.exe')} | "
-        "Select-Object -ExpandProperty CommandLine | ConvertTo-Json -Compress"
-    )
-    try:
-        completed = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", script],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=8,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            check=False,
-        )
-        raw = completed.stdout.strip()
-        if not raw:
-            return []
-        lines = json.loads(raw)
-        if isinstance(lines, str):
-            lines = [lines]
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
-        return []
-
-    roots = []
-    pattern = re.compile(r'--wechat-files-path=(?:"([^"]+)"|([^\s]+))', re.IGNORECASE)
-    for line in lines:
-        match = pattern.search(str(line or ""))
-        if match:
-            roots.append(Path(match.group(1) or match.group(2)))
-    return roots
-
-
-def _wechat_config_roots(home: Path) -> list[Path]:
-    roots: list[Path] = []
-    config_paths = [
-        home / "AppData/Roaming/Tencent/WeChat/All Users/config/3ebffe94.ini",
-        home / "AppData/Roaming/Tencent/xwechat/all_users/config/3ebffe94.ini",
-    ]
-    for config in config_paths:
-        try:
-            value = config.read_text(encoding="utf-8", errors="ignore").strip()
-        except OSError:
-            continue
-        if not value:
-            continue
-        if re.fullmatch(r"[A-Za-z]:", value):
-            value += "\\"
-        path = Path(value)
-        roots.extend([path, path / "xwechat_files"])
-    return roots
-
-
-def _wechat_account_locations(root: Path, source: str) -> list[Location]:
-    locations = []
-    if not root.is_dir():
-        return locations
-    for account in _safe_children(root):
-        has_business = (account / "business" / "emoticon").is_dir()
-        has_cache = (account / "cache").is_dir()
-        if not (has_business or has_cache):
-            continue
-        media_root = account
-        locations.append(
-            Location(
-                platform="微信",
-                account_root=account,
-                media_root=media_root,
-                label=f"微信 · {_mask_account(account.name)}",
-                source=source,
-                last_activity=max(
-                    _latest_mtime(account / "business" / "emoticon"),
-                    _latest_mtime(account / "cache"),
-                ),
-            )
-        )
-    return locations
-
-
-def discover_wechat_locations(
-    *,
-    home: Path | None = None,
-    drives: Sequence[Path] | None = None,
-    process_roots: Sequence[Path] | None = None,
-    extra_roots: Sequence[Path] = (),
-) -> list[Location]:
-    user_home = home or Path.home()
-    drive_roots = list(drives) if drives is not None else _logical_drives()
-    candidates: list[tuple[Path, str]] = []
-
-    running_roots = (
-        list(process_roots) if process_roots is not None else _extract_wechat_process_roots()
-    )
-    candidates.extend((path, "运行进程") for path in running_roots)
-    candidates.extend((path, "客户端配置") for path in _wechat_config_roots(user_home))
-    candidates.extend(
-        [
-            (user_home / "Documents" / "WeChat Files", "标准目录"),
-            (user_home / "Documents" / "xwechat_files", "标准目录"),
-        ]
-    )
-    for drive in drive_roots:
-        candidates.extend(
-            [
-                (drive / "xwechat_files", "盘符扫描"),
-                (drive / "WeChat Files", "盘符扫描"),
-            ]
-        )
-    candidates.extend((path, "手动目录") for path in extra_roots)
-
-    locations: list[Location] = []
-    for root, source in candidates:
-        if (root / "business" / "emoticon").is_dir():
-            locations.extend(_wechat_account_locations(root.parent, source))
-        else:
-            locations.extend(_wechat_account_locations(root, source))
     return _dedupe_locations(locations)
 
 
@@ -399,6 +393,7 @@ def _recent_files(roots: Iterable[Path], limit: int) -> list[Path]:
 
 
 def scan_qq(location: Location, limit: int = 120) -> list[Asset]:
+    """Read only QQ's personal “喜欢” originals, never the chat cache."""
     personal_originals = location.media_root / "personal_emoji" / "Ori"
     if not personal_originals.is_dir():
         return []
@@ -406,35 +401,6 @@ def scan_qq(location: Location, limit: int = 120) -> list[Asset]:
         detect_media(path, "QQ")
         for path in _recent_files([personal_originals], limit)
     ]
-
-
-def scan_wechat(location: Location, limit: int = 120) -> list[Asset]:
-    roots = [
-        location.account_root / "business" / "emoticon" / "Persist",
-        location.account_root / "cache",
-    ]
-    files = [
-        path
-        for path in _recent_files(roots, limit * 3)
-        if "emoticon" in str(path).casefold()
-    ][:limit]
-    return [detect_media(path, "微信") for path in files]
-
-
-def scan_douyin(download_root: Path, limit: int = 120) -> list[Asset]:
-    files = _recent_files([download_root], limit * 2)
-    assets = [detect_media(path, "抖音网页") for path in files]
-    return [asset for asset in assets if asset.readable][:limit]
-
-
-def scan_local_folder(
-    folder: Path,
-    platform: str,
-    limit: int = 120,
-) -> list[Asset]:
-    files = _recent_files([folder], limit * 2)
-    assets = [detect_media(path, platform) for path in files]
-    return [asset for asset in assets if asset.readable][:limit]
 
 
 def extract_extension_bundle(archive_path: Path, destination_root: Path) -> Path:
@@ -459,7 +425,9 @@ def extract_extension_bundle(archive_path: Path, destination_root: Path) -> Path
                 except ValueError:
                     continue
                 relative_parts = parts[marker + 1 :]
-                if not relative_parts or any(part in ("", ".", "..") for part in relative_parts):
+                if not relative_parts or any(
+                    part in ("", ".", "..") for part in relative_parts
+                ):
                     continue
                 target = staging.joinpath(*relative_parts)
                 if not target.resolve().is_relative_to(staging.resolve()):
@@ -491,6 +459,75 @@ def extract_extension_bundle(archive_path: Path, destination_root: Path) -> Path
         raise
 
 
+def copy_extension_bundle(
+    source_root: Path,
+    destination_root: Path,
+    *,
+    progress: Callable[[int, int], None] | None = None,
+) -> Path:
+    """Copy and validate the bundled extension without touching the source."""
+    manifest_path = source_root / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError("项目内没有找到 emoji-bridge-extension/manifest.json。")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("manifest_version") != 3 or not manifest.get("name"):
+        raise ValueError("项目内置扩展 manifest.json 未通过验证。")
+
+    files = [
+        path
+        for path in source_root.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    ]
+    if len(files) > 500:
+        raise ValueError("项目内置扩展文件数量异常。")
+    total = sum(path.stat().st_size for path in files)
+    if total > MAX_EXTENSION_ARCHIVE_BYTES:
+        raise ValueError("项目内置扩展超过 50 MB。")
+
+    destination_root.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(prefix=".emoji-bridge-extension-", dir=destination_root)
+    )
+    copied = 0
+    try:
+        for source in files:
+            relative = source.relative_to(source_root)
+            target = staging / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with source.open("rb") as source_stream, target.open("wb") as target_stream:
+                while True:
+                    chunk = source_stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    target_stream.write(chunk)
+                    copied += len(chunk)
+                    if progress:
+                        progress(copied, total)
+
+        copied_manifest = json.loads(
+            (staging / "manifest.json").read_text(encoding="utf-8")
+        )
+        if (
+            copied_manifest.get("manifest_version") != 3
+            or copied_manifest.get("version") != manifest.get("version")
+        ):
+            raise ValueError("复制后的扩展 manifest.json 校验失败。")
+
+        target = destination_root / "emoji-bridge-extension"
+        if target.exists():
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            target = destination_root / f"emoji-bridge-extension-{stamp}"
+            counter = 2
+            while target.exists():
+                target = destination_root / f"emoji-bridge-extension-{stamp}-{counter}"
+                counter += 1
+        staging.replace(target)
+        return target
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -501,19 +538,16 @@ def _sha256(path: Path) -> str:
 
 def export_asset(asset: Asset, library_dir: Path) -> Path:
     if not asset.readable:
-        raise ValueError("该缓存仍是加密/未知格式，不能导出。")
+        raise ValueError("该文件格式无法识别，不能导出。")
     library_dir.mkdir(parents=True, exist_ok=True)
     suffix = MEDIA_SUFFIXES.get(asset.format, asset.path.suffix.lower() or ".bin")
     stamp = datetime.fromtimestamp(asset.modified).strftime("%Y%m%d-%H%M%S")
-    platform = {"QQ": "qq", "微信": "wechat", "抖音网页": "douyin"}.get(
-        asset.platform, "emoji"
-    )
     dimensions = (
         f"_{asset.width}x{asset.height}" if asset.width and asset.height else ""
     )
     frames = f"_{asset.frames}f" if asset.frames > 1 else ""
     digest = _sha256(asset.path)
-    target = library_dir / f"{platform}_{stamp}{dimensions}{frames}_{digest[:8]}{suffix}"
+    target = library_dir / f"qq_{stamp}{dimensions}{frames}_{digest[:8]}{suffix}"
     if target.exists():
         if _sha256(target) == digest:
             return target
@@ -526,141 +560,3 @@ def export_asset(asset: Asset, library_dir: Path) -> Path:
         target.unlink(missing_ok=True)
         raise OSError("复制后的文件校验失败。")
     return target
-
-
-def prepare_for_wechat(
-    asset: Asset,
-    output_dir: Path,
-    *,
-    max_dimension: int = 240,
-    max_bytes: int = 1024 * 1024,
-) -> Path:
-    """Create a conservative WeChat custom-sticker file.
-
-    Animated assets are converted to GIF and iteratively reduced while keeping
-    the original timing. Static assets become PNG at no more than 240 px on
-    their longest side. The source file is never modified.
-    """
-    if not asset.readable:
-        raise ValueError("该缓存仍是加密/未知格式，不能生成微信兼容版。")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    digest = _sha256(asset.path)
-
-    if asset.animated:
-        target = output_dir / f"wechat_{digest[:12]}.gif"
-        if target.exists():
-            existing = detect_media(target, "微信兼容")
-            if (
-                existing.readable
-                and existing.animated
-                and existing.size <= max_bytes
-                and max(existing.width or 0, existing.height or 0) <= max_dimension
-            ):
-                return target
-        _write_wechat_gif(asset.path, target, max_dimension, max_bytes)
-    else:
-        target = output_dir / f"wechat_{digest[:12]}.png"
-        if not target.exists():
-            temporary = target.with_suffix(".tmp.png")
-            with Image.open(asset.path) as image:
-                frame = image.convert("RGBA")
-                frame.thumbnail(
-                    (max_dimension, max_dimension), Image.Resampling.LANCZOS
-                )
-                frame.save(temporary, format="PNG", optimize=True)
-            temporary.replace(target)
-
-    prepared = detect_media(target, "微信兼容")
-    if not prepared.readable:
-        raise OSError("生成的微信兼容文件无法重新解码。")
-    if asset.animated and not prepared.animated:
-        raise OSError("生成文件丢失了动画。")
-    if max(prepared.width or 0, prepared.height or 0) > max_dimension:
-        raise OSError("生成文件尺寸超过微信兼容目标。")
-    if prepared.size > max_bytes:
-        raise OSError(
-            f"生成文件仍有 {prepared.size / 1024 / 1024:.2f} MB，超过 1 MB 兼容目标。"
-        )
-    return target
-
-
-def _write_wechat_gif(
-    source: Path, target: Path, max_dimension: int, max_bytes: int
-) -> None:
-    frames: list[Image.Image] = []
-    durations: list[int] = []
-    with Image.open(source) as image:
-        frame_count = int(getattr(image, "n_frames", 1))
-        for index in range(frame_count):
-            image.seek(index)
-            frame = image.convert("RGBA")
-            frame.thumbnail(
-                (max_dimension, max_dimension), Image.Resampling.LANCZOS
-            )
-            frames.append(frame.copy())
-            durations.append(max(20, int(image.info.get("duration", 100))))
-
-    if len(frames) < 2:
-        raise ValueError("输入文件没有可保留的动画帧。")
-
-    strategies = [
-        (1, 128),
-        (1, 96),
-        (1, 64),
-        (2, 96),
-        (2, 64),
-        (3, 64),
-        (4, 48),
-    ]
-    temporary = target.with_suffix(".tmp.gif")
-    best: bytes | None = None
-    for step, colors in strategies:
-        selected: list[Image.Image] = []
-        selected_durations: list[int] = []
-        for start in range(0, len(frames), step):
-            group = frames[start : start + step]
-            selected.append(_quantize_gif_frame(group[0], colors))
-            selected_durations.append(sum(durations[start : start + step]))
-        if len(selected) < 2:
-            continue
-        selected[0].save(
-            temporary,
-            format="GIF",
-            save_all=True,
-            append_images=selected[1:],
-            duration=selected_durations,
-            loop=0,
-            optimize=False,
-            disposal=2,
-            transparency=255,
-        )
-        candidate = temporary.read_bytes()
-        if best is None or len(candidate) < len(best):
-            best = candidate
-        if len(candidate) <= max_bytes:
-            best = candidate
-            break
-
-    temporary.unlink(missing_ok=True)
-    if best is None:
-        raise OSError("无法生成微信兼容 GIF。")
-    temporary.write_bytes(best)
-    temporary.replace(target)
-
-
-def _quantize_gif_frame(frame: Image.Image, colors: int) -> Image.Image:
-    rgba = frame.convert("RGBA")
-    alpha = rgba.getchannel("A")
-    quantized = rgba.convert("RGB").quantize(
-        colors=min(254, colors),
-        method=Image.Quantize.MEDIANCUT,
-        dither=Image.Dither.FLOYDSTEINBERG,
-    )
-    transparent_mask = alpha.point(lambda value: 255 if value < 128 else 0)
-    quantized.paste(255, mask=transparent_mask)
-    palette = quantized.getpalette() or []
-    palette.extend([0] * (768 - len(palette)))
-    palette[255 * 3 : 255 * 3 + 3] = [0, 0, 0]
-    quantized.putpalette(palette[:768])
-    quantized.info["transparency"] = 255
-    return quantized

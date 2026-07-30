@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import os
 import json
+import os
 import queue
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,64 +20,141 @@ from PIL import Image, ImageTk, UnidentifiedImageError
 from .core import (
     Asset,
     Location,
-    detect_media,
+    copy_extension_bundle,
     discover_qq_locations,
-    discover_wechat_locations,
-    extract_extension_bundle,
     export_asset,
-    prepare_for_wechat,
-    scan_douyin,
-    scan_local_folder,
+    extract_extension_bundle,
+    list_local_drives,
     scan_qq,
 )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LIBRARY_DIR = PROJECT_ROOT / "library"
-WECHAT_INBOX_DIR = LIBRARY_DIR / "wechat-inbox"
-DEFAULT_DOUYIN_DIR = Path.home() / "Downloads" / "EmojiBridge"
-EXTENSION_DOWNLOAD_DIR = DEFAULT_DOUYIN_DIR
+EXTENSION_DOWNLOAD_DIR = Path.home() / "Downloads" / "EmojiBridge"
 EXTENSION_ARCHIVE_URL = (
     "https://github.com/sujingyan12138/Emoji-download/archive/refs/heads/main.zip"
 )
 CONFIG_DIR = Path(os.getenv("APPDATA", Path.home())) / "EmojiBridge"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+CHROME_EXTENSIONS_URL = "chrome://extensions/"
+
+
+def find_chrome_executable() -> Path | None:
+    candidates: list[Path] = []
+    command_names = ("chrome.exe", "chrome") if os.name == "nt" else (
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+    )
+    for command_name in command_names:
+        resolved = shutil.which(command_name)
+        if resolved:
+            candidates.append(Path(resolved))
+
+    if os.name == "nt":
+        for variable in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+            base = os.getenv(variable)
+            if base:
+                candidates.append(
+                    Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe"
+                )
+
+        try:
+            import winreg
+
+            key_path = (
+                r"Software\Microsoft\Windows\CurrentVersion"
+                r"\App Paths\chrome.exe"
+            )
+            for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    with winreg.OpenKey(root, key_path) as key:
+                        registered = winreg.QueryValue(key, None)
+                except OSError:
+                    continue
+                if registered:
+                    candidates.append(Path(registered.strip().strip('"')))
+        except ImportError:
+            pass
+
+    checked: set[str] = set()
+    for candidate in candidates:
+        candidate_key = os.path.normcase(str(candidate))
+        if candidate_key in checked:
+            continue
+        checked.add(candidate_key)
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def launch_chrome() -> bool:
+    chrome = find_chrome_executable()
+    if chrome is None:
+        return False
+    try:
+        subprocess.Popen(
+            [str(chrome)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    return True
 
 
 class EmojiBridgeApp(tk.Tk):
     COLORS = {
-        "ink": "#1f1c18",
-        "paper": "#f4efe3",
-        "cream": "#fffaf0",
-        "red": "#d7523f",
-        "teal": "#177f78",
-        "muted": "#746e64",
-        "line": "#d8cdbb",
-        "gold": "#d7a943",
+        "background": "#F5F5F7",
+        "surface": "#FFFFFF",
+        "surface_alt": "#FAFAFC",
+        "text": "#1D1D1F",
+        "secondary_text": "#6E6E73",
+        "tertiary_text": "#86868B",
+        "separator": "#D2D2D7",
+        "separator_soft": "#E5E5EA",
+        "control": "#E8E8ED",
+        "control_hover": "#DEDEE3",
+        "primary": "#0071E3",
+        "primary_hover": "#0077ED",
+        "primary_pressed": "#0062C4",
+        "primary_tint": "#EAF3FF",
+        "primary_text": "#0057B8",
+        "success": "#248A3D",
+        "success_tint": "#EDFAF0",
+        "error": "#D70015",
+        "error_tint": "#FFF1F2",
     }
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("表情中转站 · Emoji Bridge")
-        self.geometry("1000x660")
-        self.minsize(860, 560)
-        self.configure(bg=self.COLORS["paper"])
+        self.title("表情中转站 · QQ & Douyin")
+        self.geometry("1180x760")
+        self.minsize(980, 640)
+        self.configure(bg=self.COLORS["background"])
 
         self.config_data = self._load_config()
         self.platform = "QQ"
-        self.locations: dict[str, list[Location]] = {"QQ": [], "微信": []}
+        self.locations: list[Location] = []
+        self.scanned_drives: list[Path] = []
         self.assets: list[Asset] = []
         self.thumbnail_images: list[ImageTk.PhotoImage] = []
         self.preview_image: ImageTk.PhotoImage | None = None
         self.preview_frames: list[ImageTk.PhotoImage] = []
         self.preview_job: str | None = None
-        self.extension_guide: tk.Toplevel | None = None
+
+        self.discovery_running = False
+        self.discovery_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.extension_download_running = False
         self.extension_download_queue: queue.Queue[tuple[str, object]] = queue.Queue()
-        self.downloaded_extension_dir: Path | None = None
-        self.target_var = tk.StringVar(value="保留原件（QQ / 抖音）")
+        self.downloaded_extension_dir = self._find_existing_extension()
+
         self._build_styles()
         self._build_ui()
+        if self.downloaded_extension_dir:
+            self._show_extension_download_success(self.downloaded_extension_dir)
         if os.name == "nt":
             self.state("zoomed")
         self.after(80, self.refresh_sources)
@@ -86,173 +164,286 @@ class EmojiBridgeApp(tk.Tk):
         style.theme_use("clam")
         style.configure(
             "Bridge.Treeview",
-            background=self.COLORS["cream"],
-            fieldbackground=self.COLORS["cream"],
-            foreground=self.COLORS["ink"],
-            rowheight=76,
+            background=self.COLORS["surface"],
+            fieldbackground=self.COLORS["surface"],
+            foreground=self.COLORS["text"],
+            rowheight=74,
             borderwidth=0,
             font=("Microsoft YaHei UI", 10),
         )
         style.configure(
             "Bridge.Treeview.Heading",
-            background=self.COLORS["ink"],
-            foreground=self.COLORS["cream"],
+            background=self.COLORS["surface_alt"],
+            foreground=self.COLORS["secondary_text"],
             borderwidth=0,
             relief="flat",
             font=("Microsoft YaHei UI", 9, "bold"),
         )
         style.map(
             "Bridge.Treeview",
-            background=[("selected", self.COLORS["teal"])],
-            foreground=[("selected", "#ffffff")],
+            background=[("selected", self.COLORS["primary_tint"])],
+            foreground=[("selected", self.COLORS["primary_text"])],
         )
         style.configure(
             "Bridge.TCombobox",
-            fieldbackground=self.COLORS["cream"],
-            background=self.COLORS["cream"],
-            padding=7,
+            fieldbackground=self.COLORS["surface"],
+            background=self.COLORS["surface"],
+            foreground=self.COLORS["text"],
+            bordercolor=self.COLORS["separator"],
+            lightcolor=self.COLORS["surface"],
+            darkcolor=self.COLORS["surface"],
+            arrowcolor=self.COLORS["secondary_text"],
+            padding=8,
+        )
+        style.map(
+            "Bridge.TCombobox",
+            fieldbackground=[("readonly", self.COLORS["surface"])],
+            foreground=[("readonly", self.COLORS["text"])],
+            selectbackground=[("readonly", self.COLORS["surface"])],
+            selectforeground=[("readonly", self.COLORS["text"])],
+        )
+        style.configure(
+            "Bridge.Horizontal.TProgressbar",
+            background=self.COLORS["primary"],
+            troughcolor=self.COLORS["control"],
+            borderwidth=0,
+            lightcolor=self.COLORS["primary"],
+            darkcolor=self.COLORS["primary"],
         )
 
+    def _make_button(
+        self,
+        parent: tk.Misc,
+        text: str,
+        command: object,
+        *,
+        kind: str = "secondary",
+        font_size: int = 9,
+        padx: int = 14,
+        pady: int = 8,
+        state: str = "normal",
+    ) -> tk.Button:
+        if kind == "primary":
+            background = self.COLORS["primary"]
+            hover = self.COLORS["primary_hover"]
+            foreground = "white"
+        elif kind == "ghost":
+            background = self.COLORS["surface"]
+            hover = self.COLORS["control"]
+            foreground = self.COLORS["text"]
+        else:
+            background = self.COLORS["control"]
+            hover = self.COLORS["control_hover"]
+            foreground = self.COLORS["text"]
+        button = tk.Button(
+            parent,
+            text=text,
+            command=command,
+            state=state,
+            bd=0,
+            relief="flat",
+            highlightthickness=0,
+            bg=background,
+            activebackground=hover,
+            fg=foreground,
+            activeforeground=foreground,
+            disabledforeground=self.COLORS["tertiary_text"],
+            padx=padx,
+            pady=pady,
+            cursor="hand2",
+            font=("Microsoft YaHei UI", font_size, "bold"),
+        )
+        button._bridge_normal = background  # type: ignore[attr-defined]
+        button._bridge_hover = hover  # type: ignore[attr-defined]
+
+        def enter(_event: object) -> None:
+            if str(button["state"]) != "disabled":
+                button.configure(
+                    bg=getattr(button, "_bridge_hover", hover),
+                )
+
+        def leave(_event: object) -> None:
+            button.configure(
+                bg=getattr(button, "_bridge_normal", background),
+            )
+
+        button.bind("<Enter>", enter)
+        button.bind("<Leave>", leave)
+        return button
+
     def _build_ui(self) -> None:
-        header = tk.Frame(self, bg=self.COLORS["ink"], height=96)
+        header = tk.Frame(self, bg=self.COLORS["background"], height=112)
         header.pack(fill="x")
         header.pack_propagate(False)
+        header_copy = tk.Frame(header, bg=self.COLORS["background"])
+        header_copy.pack(side="left", fill="y", padx=(34, 0))
         tk.Label(
-            header,
-            text="EMOJI TRANSFER DESK  /  本地原件中转",
-            bg=self.COLORS["ink"],
-            fg=self.COLORS["gold"],
-            font=("Consolas", 10, "bold"),
-        ).pack(anchor="w", padx=28, pady=(18, 2))
+            header_copy,
+            text="EMOJI BRIDGE",
+            bg=self.COLORS["background"],
+            fg=self.COLORS["primary"],
+            font=("Segoe UI", 9, "bold"),
+        ).pack(anchor="w", pady=(20, 2))
         tk.Label(
-            header,
+            header_copy,
             text="表情中转站",
-            bg=self.COLORS["ink"],
-            fg="#fff8e9",
-            font=("Microsoft YaHei UI", 24, "bold"),
-        ).pack(anchor="w", padx=27)
+            bg=self.COLORS["background"],
+            fg=self.COLORS["text"],
+            font=("Microsoft YaHei UI", 25, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            header_copy,
+            text="整理 QQ 喜欢表情，安装抖音原件提取扩展。",
+            bg=self.COLORS["background"],
+            fg=self.COLORS["secondary_text"],
+            font=("Microsoft YaHei UI", 9),
+        ).pack(anchor="w", pady=(2, 0))
+        self._make_button(
+            header,
+            "打开本地表情库",
+            lambda: self.open_folder(LIBRARY_DIR),
+        ).pack(side="right", padx=34)
 
-        route = tk.Frame(self, bg=self.COLORS["paper"], pady=10, height=68)
-        route.pack(fill="x", padx=24)
-        tk.Button(
-            route,
-            text="打开表情库",
-            command=lambda: self.open_folder(LIBRARY_DIR),
-            bd=0,
-            bg=self.COLORS["gold"],
-            fg=self.COLORS["ink"],
-            padx=15,
-            pady=8,
-            cursor="hand2",
-            font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(side="right")
+        route = tk.Frame(
+            self,
+            bg=self.COLORS["surface"],
+            highlightthickness=1,
+            highlightbackground=self.COLORS["separator_soft"],
+        )
+        route.pack(fill="x", padx=32, pady=(0, 12))
         tk.Label(
             route,
-            text="来源",
-            bg=self.COLORS["paper"],
-            fg=self.COLORS["muted"],
-            font=("Microsoft YaHei UI", 9),
-        ).pack(side="left", padx=(2, 10))
+            text="工作区",
+            bg=self.COLORS["surface"],
+            fg=self.COLORS["secondary_text"],
+            font=("Microsoft YaHei UI", 9, "bold"),
+        ).pack(side="left", padx=(16, 10), pady=13)
         self.source_buttons: dict[str, tk.Button] = {}
-        for platform in ("抖音网页", "QQ", "微信"):
-            button = tk.Button(
+        for platform in ("QQ", "抖音扩展"):
+            button = self._make_button(
                 route,
-                text=platform,
-                command=lambda value=platform: self.set_platform(value),
-                bd=0,
+                platform,
+                lambda value=platform: self.set_platform(value),
                 padx=18,
-                pady=8,
-                cursor="hand2",
-                font=("Microsoft YaHei UI", 10, "bold"),
+                pady=7,
             )
-            button.pack(side="left", padx=3)
+            button.pack(side="left", padx=2, pady=9)
             self.source_buttons[platform] = button
         tk.Label(
             route,
-            text="→  本地表情库  →  微信 / QQ / 抖音",
-            bg=self.COLORS["paper"],
-            fg=self.COLORS["ink"],
-            font=("Microsoft YaHei UI", 10, "bold"),
+            text="QQ 页负责扫描与导出 · 抖音页只负责扩展安装",
+            bg=self.COLORS["surface"],
+            fg=self.COLORS["secondary_text"],
+            font=("Microsoft YaHei UI", 9),
         ).pack(side="left", padx=18)
 
-        controls = tk.Frame(self, bg=self.COLORS["paper"], height=54)
-        controls.pack(fill="x", padx=26, pady=(0, 12))
-        tk.Button(
-            controls,
-            text="手动选择",
-            command=self.choose_folder,
-            bd=0,
-            bg=self.COLORS["cream"],
-            fg=self.COLORS["ink"],
-            padx=16,
-            pady=8,
-            cursor="hand2",
-            font=("Microsoft YaHei UI", 9),
-        ).pack(side="right", padx=4)
-        tk.Button(
-            controls,
-            text="重新发现",
-            command=self.refresh_sources,
-            bd=0,
-            bg=self.COLORS["teal"],
-            fg="white",
-            padx=16,
-            pady=8,
-            cursor="hand2",
-            font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(side="right", padx=(8, 4))
-        tk.Button(
-            controls,
-            text="全选当前",
-            command=self.select_all,
-            bd=0,
-            bg=self.COLORS["cream"],
-            fg=self.COLORS["ink"],
-            padx=14,
-            pady=8,
-            cursor="hand2",
-            font=("Microsoft YaHei UI", 9),
-        ).pack(side="right", padx=4)
+        self.page_host = tk.Frame(self, bg=self.COLORS["background"])
+        self.page_host.pack(fill="both", expand=True, padx=32, pady=(0, 14))
+        self.qq_page = tk.Frame(self.page_host, bg=self.COLORS["background"])
+        self.douyin_page = tk.Frame(self.page_host, bg=self.COLORS["background"])
+        self._build_qq_page()
+        self._build_douyin_page()
+        self.qq_page.pack(fill="both", expand=True)
+        self._paint_source_buttons()
+
+    def _build_qq_page(self) -> None:
+        controls = tk.Frame(
+            self.qq_page,
+            bg=self.COLORS["surface"],
+            highlightthickness=1,
+            highlightbackground=self.COLORS["separator_soft"],
+        )
+        controls.pack(fill="x", pady=(0, 10))
+        control_copy = tk.Frame(controls, bg=self.COLORS["surface"])
+        control_copy.pack(side="left", padx=(16, 10), pady=10)
+        tk.Label(
+            control_copy,
+            text="QQ 喜欢表情",
+            bg=self.COLORS["surface"],
+            fg=self.COLORS["text"],
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            control_copy,
+            text="只读取 personal_emoji\\Ori，不读取聊天缓存",
+            bg=self.COLORS["surface"],
+            fg=self.COLORS["secondary_text"],
+            font=("Microsoft YaHei UI", 8),
+        ).pack(anchor="w")
+
         self.location_var = tk.StringVar()
         self.location_combo = ttk.Combobox(
             controls,
             textvariable=self.location_var,
             state="readonly",
             style="Bridge.TCombobox",
-            width=32,
+            width=36,
         )
-        self.location_combo.pack(side="left", fill="x", expand=True)
+        self.location_combo.pack(
+            side="left",
+            fill="x",
+            expand=True,
+            padx=(4, 10),
+            pady=12,
+        )
         self.location_combo.bind("<<ComboboxSelected>>", lambda _event: self.scan())
 
-        self.source_notice = tk.Frame(
-            self,
-            bg="#fff3cf",
-            highlightthickness=1,
-            highlightbackground="#e2c46b",
+        self._make_button(
+            controls,
+            "手动选择",
+            self.choose_folder,
+            kind="ghost",
+        ).pack(side="right", padx=(4, 12), pady=12)
+        self.discover_button = self._make_button(
+            controls,
+            "重新发现路径",
+            self.refresh_sources,
         )
-        self.source_notice_text = tk.Label(
-            self.source_notice,
-            text="",
-            justify="left",
-            anchor="w",
-            wraplength=760,
-            bg="#fff3cf",
-            fg=self.COLORS["ink"],
-            font=("Microsoft YaHei UI", 9),
-        )
-        self.source_notice_text.pack(side="left", fill="x", expand=True, padx=14, pady=10)
-        self.notice_buttons = tk.Frame(self.source_notice, bg="#fff3cf")
-        self.notice_buttons.pack(side="right", padx=8, pady=6)
+        self.discover_button.pack(side="right", padx=4, pady=12)
+        self._make_button(
+            controls,
+            "重新扫描表情",
+            self.scan,
+            kind="primary",
+        ).pack(side="right", padx=4, pady=12)
 
-        self.body = tk.Frame(
-            self,
-            bg=self.COLORS["line"],
-            bd=0,
+        toolbar = tk.Frame(self.qq_page, bg=self.COLORS["background"])
+        toolbar.pack(fill="x", pady=(0, 8))
+        self.status = tk.Label(
+            toolbar,
+            text="正在准备扫描本机磁盘…",
+            anchor="w",
+            bg=self.COLORS["background"],
+            fg=self.COLORS["secondary_text"],
+            font=("Microsoft YaHei UI", 8),
         )
-        self.body.pack(fill="both", expand=True, padx=24, pady=(0, 14))
-        left = tk.Frame(self.body, bg=self.COLORS["cream"])
-        right = tk.Frame(self.body, bg=self.COLORS["ink"], width=300)
-        right.pack(side="right", fill="y", padx=(6, 0))
+        self.status.pack(side="left", fill="x", expand=True, padx=2)
+        self.select_all_button = self._make_button(
+            toolbar,
+            "全选可导出项",
+            self.select_all,
+            kind="ghost",
+            font_size=8,
+            pady=6,
+        )
+        self.select_all_button.pack(side="right")
+
+        body = tk.Frame(self.qq_page, bg=self.COLORS["background"])
+        body.pack(fill="both", expand=True)
+        left = tk.Frame(
+            body,
+            bg=self.COLORS["surface"],
+            highlightthickness=1,
+            highlightbackground=self.COLORS["separator_soft"],
+        )
+        right = tk.Frame(
+            body,
+            bg=self.COLORS["surface"],
+            width=340,
+            highlightthickness=1,
+            highlightbackground=self.COLORS["separator_soft"],
+        )
+        right.pack(side="right", fill="y", padx=(12, 0))
         right.pack_propagate(False)
         left.pack(side="left", fill="both", expand=True)
 
@@ -267,13 +458,19 @@ class EmojiBridgeApp(tk.Tk):
         self.tree.heading("#0", text="预览")
         self.tree.column("#0", width=92, minwidth=92, stretch=False, anchor="center")
         labels = {
-            "format": "格式",
+            "format": "真实格式",
             "dimensions": "尺寸",
             "frames": "动画",
             "size": "大小",
-            "modified": "缓存时间",
+            "modified": "加入时间",
         }
-        widths = {"format": 110, "dimensions": 100, "frames": 90, "size": 90, "modified": 155}
+        widths = {
+            "format": 110,
+            "dimensions": 100,
+            "frames": 90,
+            "size": 90,
+            "modified": 155,
+        }
         for name in columns:
             self.tree.heading(name, text=labels[name])
             self.tree.column(name, width=widths[name], anchor="center")
@@ -285,18 +482,25 @@ class EmojiBridgeApp(tk.Tk):
 
         tk.Label(
             right,
-            text="PREVIEW / 原件检查",
-            bg=self.COLORS["ink"],
-            fg=self.COLORS["gold"],
-            font=("Consolas", 10, "bold"),
-        ).pack(anchor="w", padx=22, pady=(20, 8))
+            text="原件预览",
+            bg=self.COLORS["surface"],
+            fg=self.COLORS["text"],
+            font=("Microsoft YaHei UI", 14, "bold"),
+        ).pack(anchor="w", padx=22, pady=(20, 1))
+        tk.Label(
+            right,
+            text="核对格式、尺寸、帧数与动画",
+            bg=self.COLORS["surface"],
+            fg=self.COLORS["secondary_text"],
+            font=("Microsoft YaHei UI", 8),
+        ).pack(anchor="w", padx=22, pady=(0, 11))
         self.preview = tk.Label(
             right,
-            text="选择一个表情\n检查格式和动画",
-            bg="#29251f",
-            fg="#d9d0c1",
+            text="选择一个表情\n查看原件信息",
+            bg=self.COLORS["surface_alt"],
+            fg=self.COLORS["tertiary_text"],
             width=28,
-            height=13,
+            height=9,
             font=("Microsoft YaHei UI", 11),
         )
         self.preview.pack(fill="x", padx=22)
@@ -305,538 +509,344 @@ class EmojiBridgeApp(tk.Tk):
             text="",
             justify="left",
             anchor="nw",
-            wraplength=290,
-            bg=self.COLORS["ink"],
-            fg="#eee5d7",
+            wraplength=296,
+            bg=self.COLORS["surface"],
+            fg=self.COLORS["secondary_text"],
             font=("Microsoft YaHei UI", 9),
         )
-        self.detail.pack(fill="x", padx=22, pady=16)
-        tk.Label(
+        self.detail.pack(fill="x", padx=22, pady=15)
+
+        self.export_button = self._make_button(
             right,
-            text="输出方案",
-            anchor="w",
-            bg=self.COLORS["ink"],
-            fg=self.COLORS["gold"],
-            font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(fill="x", padx=22, pady=(0, 5))
-        self.target_combo = ttk.Combobox(
-            right,
-            textvariable=self.target_var,
-            values=("保留原件（QQ / 抖音）", "微信兼容版"),
-            state="readonly",
-            style="Bridge.TCombobox",
-        )
-        self.target_combo.pack(fill="x", padx=22, pady=(0, 10))
-        self.target_combo.bind(
-            "<<ComboboxSelected>>", lambda _event: self._refresh_export_button()
-        )
-        self.export_button = tk.Button(
-            right,
-            text="复制选中到本地表情库",
-            command=self.export_selected,
-            state="disabled",
-            bd=0,
-            bg=self.COLORS["red"],
-            activebackground="#b64031",
-            fg="white",
-            padx=15,
+            "复制原件到表情库 · 0 项",
+            self.export_selected,
+            kind="primary",
+            font_size=10,
             pady=12,
-            cursor="hand2",
-            font=("Microsoft YaHei UI", 10, "bold"),
+            state="disabled",
         )
-        self.export_button.pack(fill="x", padx=22, pady=(0, 9))
+        self.export_button.pack(fill="x", padx=22, pady=(0, 9), side="bottom")
         tk.Label(
             right,
-            text="不修改 QQ / 微信数据库；导入目标平台走官方发送与收藏流程。",
+            text="导出时会校验文件哈希；不会修改 QQ 数据库。",
             justify="left",
             wraplength=290,
-            bg=self.COLORS["ink"],
-            fg="#a79d8e",
+            bg=self.COLORS["surface"],
+            fg=self.COLORS["tertiary_text"],
             font=("Microsoft YaHei UI", 8),
-        ).pack(fill="x", padx=22)
+        ).pack(fill="x", padx=22, pady=(0, 12), side="bottom")
 
-        self.status = tk.Label(
-            self,
-            text="正在发现客户端数据目录…",
-            anchor="w",
-            bg=self.COLORS["paper"],
-            fg=self.COLORS["muted"],
+    def _build_douyin_page(self) -> None:
+        hero = tk.Frame(
+            self.douyin_page,
+            bg=self.COLORS["surface"],
+            highlightthickness=1,
+            highlightbackground=self.COLORS["separator_soft"],
+        )
+        hero.pack(fill="x", pady=(0, 10))
+        hero_copy = tk.Frame(hero, bg=self.COLORS["surface"])
+        hero_copy.pack(side="left", fill="both", expand=True, padx=22, pady=18)
+        tk.Label(
+            hero_copy,
+            text="CHROME EXTENSION",
+            bg=self.COLORS["surface"],
+            fg=self.COLORS["primary"],
+            font=("Segoe UI", 9, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            hero_copy,
+            text="从抖音私信提取表情原件",
+            bg=self.COLORS["surface"],
+            fg=self.COLORS["text"],
+            font=("Microsoft YaHei UI", 18, "bold"),
+        ).pack(anchor="w", pady=(2, 3))
+        tk.Label(
+            hero_copy,
+            text="这个页面不扫描本地文件，只负责下载扩展和完成安装。",
+            bg=self.COLORS["surface"],
+            fg=self.COLORS["secondary_text"],
             font=("Microsoft YaHei UI", 9),
+        ).pack(anchor="w")
+
+        hero_actions = tk.Frame(hero, bg=self.COLORS["surface"])
+        hero_actions.pack(side="right", padx=20)
+        self.extension_download_button = self._make_button(
+            hero_actions,
+            "获取 / 更新扩展",
+            self._start_extension_download,
+            kind="primary",
+            padx=18,
+            pady=10,
         )
-        self.status.pack(fill="x", padx=27, pady=(0, 16))
-        self._paint_source_buttons()
-
-    def _update_source_notice(self) -> None:
-        for child in self.notice_buttons.winfo_children():
-            child.destroy()
-        self.source_notice.pack_forget()
-        if self.platform == "QQ":
-            return
-
-        is_douyin = self.platform == "抖音网页"
-        background = "#fff3cf" if is_douyin else "#fde5df"
-        border = "#e2c46b" if is_douyin else "#dc8173"
-        self.source_notice.configure(bg=background, highlightbackground=border)
-        self.source_notice_text.configure(bg=background)
-        self.notice_buttons.configure(bg=background)
-        self.source_notice.pack(
-            fill="x",
-            padx=24,
-            pady=(0, 10),
-            before=self.body,
-        )
-
-        if not is_douyin:
-            self.source_notice_text.configure(
-                text=(
-                    "微信自动读取不可用：微信 4.x 的个人表情缓存已加密。可用流程是把表情"
-                    "发送到文件传输助手，右键消息选择“另存为…”，保存到微信接收箱；"
-                    "本页会读取并预览接收箱。静态图片菜单已实测，动态表情仍待验证。"
-                )
-            )
-            tk.Button(
-                self.notice_buttons,
-                text="打开微信接收箱",
-                command=lambda: self.open_folder(WECHAT_INBOX_DIR),
-                bd=0,
-                bg=self.COLORS["cream"],
-                fg=self.COLORS["ink"],
-                padx=10,
-                pady=6,
-                cursor="hand2",
-                font=("Microsoft YaHei UI", 8, "bold"),
-            ).pack(side="left", padx=3)
-            return
-
-        self.source_notice_text.configure(
-            text=(
-                "抖音下载箱：Chrome 扩展负责提取网页表情，本页负责预览、筛选和生成"
-                "微信兼容版。首次使用请先下载扩展并按安装票据完成设置。"
-            )
-        )
-        tk.Button(
-            self.notice_buttons,
-            text="下载 Chrome 扩展",
-            command=lambda: self.show_extension_guide(start_download=True),
-            bd=0,
-            bg=self.COLORS["red"],
-            fg="white",
-            padx=12,
-            pady=6,
-            cursor="hand2",
-            font=("Microsoft YaHei UI", 8, "bold"),
-        ).pack(side="left", padx=3)
-        actions = (
-            ("安装教程", lambda: self.show_extension_guide(start_download=False)),
-            ("Chrome 扩展页", lambda: webbrowser.open("chrome://extensions/")),
-            ("打开抖音", lambda: webbrowser.open("https://www.douyin.com/")),
-        )
-        for text, command in actions:
-            tk.Button(
-                self.notice_buttons,
-                text=text,
-                command=command,
-                bd=0,
-                bg=self.COLORS["cream"],
-                fg=self.COLORS["ink"],
-                padx=10,
-                pady=6,
-                cursor="hand2",
-                font=("Microsoft YaHei UI", 8, "bold"),
-            ).pack(side="left", padx=3)
-
-    def show_extension_guide(self, *, start_download: bool) -> None:
-        if self.extension_guide and self.extension_guide.winfo_exists():
-            self.extension_guide.deiconify()
-            self.extension_guide.lift()
-            self.extension_guide.focus_force()
-            if start_download:
-                self._start_extension_download()
-            return
-
-        dialog = tk.Toplevel(self)
-        self.extension_guide = dialog
-        dialog.title("安装抖音提取扩展 · Emoji Bridge")
-        dialog.geometry("780x600")
-        dialog.minsize(720, 560)
-        dialog.configure(bg=self.COLORS["paper"])
-        dialog.transient(self)
-        dialog.protocol("WM_DELETE_WINDOW", self._close_extension_guide)
-
-        header = tk.Frame(dialog, bg=self.COLORS["ink"], height=108)
-        header.pack(fill="x")
-        header.pack_propagate(False)
-        tk.Label(
-            header,
-            text="CHROME EXTENSION / INSTALL TICKET",
-            bg=self.COLORS["ink"],
-            fg=self.COLORS["gold"],
-            font=("Consolas", 10, "bold"),
-        ).pack(anchor="w", padx=28, pady=(17, 2))
-        tk.Label(
-            header,
-            text="安装抖音提取扩展",
-            bg=self.COLORS["ink"],
-            fg=self.COLORS["cream"],
-            font=("Microsoft YaHei UI", 22, "bold"),
-        ).pack(anchor="w", padx=27)
+        self.extension_download_button.pack(side="left", padx=4)
+        self._make_button(
+            hero_actions,
+            "复制扩展页地址",
+            self._open_extension_page,
+            kind="ghost",
+            pady=10,
+        ).pack(side="left", padx=4)
+        self._make_button(
+            hero_actions,
+            "打开抖音",
+            lambda: webbrowser.open("https://www.douyin.com/"),
+            kind="ghost",
+            pady=10,
+        ).pack(side="left", padx=4)
 
         status_card = tk.Frame(
-            dialog,
-            bg="#fff3cf",
+            self.douyin_page,
+            bg=self.COLORS["primary_tint"],
             highlightthickness=1,
-            highlightbackground="#e2c46b",
+            highlightbackground="#CFE3FF",
         )
-        status_card.pack(fill="x", padx=24, pady=(18, 12))
+        status_card.pack(fill="x", pady=(0, 12))
         self.extension_status_label = tk.Label(
             status_card,
-            text="尚未下载 · 点击下方按钮获取最新版扩展。",
+            text="尚未准备 · 点击“获取 / 更新扩展”。",
             anchor="w",
-            bg="#fff3cf",
-            fg=self.COLORS["ink"],
+            bg=self.COLORS["primary_tint"],
+            fg=self.COLORS["text"],
             font=("Microsoft YaHei UI", 10, "bold"),
         )
-        self.extension_status_label.pack(fill="x", padx=14, pady=(10, 2))
+        self.extension_status_label.pack(fill="x", padx=16, pady=(10, 2))
         self.extension_path_label = tk.Label(
             status_card,
-            text="来源：github.com/sujingyan12138/Emoji-download",
+            text="优先使用项目内置扩展；内置目录缺失时从 GitHub 下载。",
             anchor="w",
             justify="left",
-            wraplength=690,
-            bg="#fff3cf",
-            fg=self.COLORS["muted"],
-            font=("Consolas", 8),
+            wraplength=1000,
+            bg=self.COLORS["primary_tint"],
+            fg=self.COLORS["secondary_text"],
+            font=("Segoe UI", 8),
         )
-        self.extension_path_label.pack(fill="x", padx=14, pady=(0, 8))
-        self.extension_progress = ttk.Progressbar(status_card, mode="indeterminate")
-        self.extension_progress.pack(fill="x", padx=14, pady=(0, 10))
-
-        steps = (
-            ("01", "下载完成", "程序会自动下载、解压并验证 manifest.json。不要选择 ZIP 文件。"),
-            ("02", "打开扩展管理", "在 Chrome 地址栏输入 chrome://extensions/。"),
-            ("03", "开启开发者模式", "打开扩展页右上角的“开发者模式”开关。"),
-            (
-                "04",
-                "加载文件夹",
-                "点击“加载已解压的扩展程序”，选择下面显示的 emoji-bridge-extension 文件夹。",
-            ),
-            ("05", "刷新抖音", "固定扩展图标，刷新已打开的抖音页面，再进入私信。"),
-            ("06", "扫描与下载", "打开黄色“表情中转站”，扫描当前会话并下载选中原件。"),
+        self.extension_path_label.pack(fill="x", padx=16, pady=(0, 7))
+        self.extension_progress = ttk.Progressbar(
+            status_card,
+            mode="determinate",
+            maximum=100,
+            value=0,
+            style="Bridge.Horizontal.TProgressbar",
         )
-        steps_frame = tk.Frame(dialog, bg=self.COLORS["paper"])
-        steps_frame.pack(fill="both", expand=True, padx=24)
-        steps_frame.grid_columnconfigure(0, weight=1, uniform="ticket")
-        steps_frame.grid_columnconfigure(1, weight=1, uniform="ticket")
-        for index, (number, title, body) in enumerate(steps):
-            row = tk.Frame(
-                steps_frame,
-                bg=self.COLORS["cream"],
-                highlightthickness=1,
-                highlightbackground=self.COLORS["line"],
-            )
-            row.grid(
-                row=index // 2,
-                column=index % 2,
-                sticky="nsew",
-                padx=3,
-                pady=3,
-            )
-            tk.Label(
-                row,
-                text=number,
-                width=4,
-                bg=self.COLORS["red"],
-                fg="white",
-                font=("Consolas", 10, "bold"),
-            ).pack(side="left", fill="y")
-            copy = tk.Frame(row, bg=self.COLORS["cream"])
-            copy.pack(side="left", fill="x", expand=True, padx=12, pady=7)
-            tk.Label(
-                copy,
-                text=title,
-                anchor="w",
-                bg=self.COLORS["cream"],
-                fg=self.COLORS["ink"],
-                font=("Microsoft YaHei UI", 9, "bold"),
-            ).pack(fill="x")
-            tk.Label(
-                copy,
-                text=body,
-                anchor="w",
-                justify="left",
-                wraplength=280,
-                bg=self.COLORS["cream"],
-                fg=self.COLORS["muted"],
-                font=("Microsoft YaHei UI", 8),
-            ).pack(fill="x")
+        self.extension_progress.pack(fill="x", padx=16, pady=(0, 8))
+        self.extension_progress.pack_forget()
+        status_actions = tk.Frame(status_card, bg=self.COLORS["primary_tint"])
+        status_actions.pack(fill="x", padx=12, pady=(0, 8))
+        self.extension_open_button = self._make_button(
+            status_actions,
+            "打开扩展文件夹",
+            self._open_downloaded_extension,
+            kind="ghost",
+            font_size=8,
+            pady=6,
+            state="disabled",
+        )
+        self.extension_open_button.pack(side="left", padx=3)
+        self.extension_copy_button = self._make_button(
+            status_actions,
+            "复制文件夹路径",
+            self._copy_extension_path,
+            kind="ghost",
+            font_size=8,
+            pady=6,
+            state="disabled",
+        )
+        self.extension_copy_button.pack(side="left", padx=3)
 
         tk.Label(
-            dialog,
+            self.douyin_page,
+            text="三步完成安装",
+            anchor="w",
+            bg=self.COLORS["background"],
+            fg=self.COLORS["text"],
+            font=("Microsoft YaHei UI", 12, "bold"),
+        ).pack(fill="x", padx=2, pady=(0, 7))
+        steps = (
+            (
+                "01",
+                "粘贴扩展页地址",
+                "点击上方“复制扩展页地址”，在 Chrome 地址栏按 Ctrl+V，"
+                "再按 Enter。",
+            ),
+            (
+                "02",
+                "开启开发者模式",
+                "打开“开发者模式”，点击“加载已解压的扩展程序”，选择 "
+                "emoji-bridge-extension 文件夹。",
+            ),
+            (
+                "03",
+                "固定并开始使用",
+                "然后固定扩展图标，刷新已打开的抖音页面，再进入私信。"
+                "打开黄色“表情中转站”，扫描当前会话并下载选中原件。",
+            ),
+        )
+        steps_frame = tk.Frame(self.douyin_page, bg=self.COLORS["background"])
+        steps_frame.pack(fill="both", expand=True)
+        for column in range(3):
+            steps_frame.grid_columnconfigure(column, weight=1, uniform="steps")
+        for column, (number, title, body) in enumerate(steps):
+            card = tk.Frame(
+                steps_frame,
+                bg=self.COLORS["surface"],
+                highlightthickness=1,
+                highlightbackground=self.COLORS["separator_soft"],
+            )
+            card.grid(
+                row=0,
+                column=column,
+                sticky="nsew",
+                padx=(0 if column == 0 else 5, 0 if column == 2 else 5),
+            )
+            tk.Label(
+                card,
+                text=number,
+                bg=self.COLORS["primary_tint"],
+                fg=self.COLORS["primary_text"],
+                font=("Segoe UI", 11, "bold"),
+                padx=10,
+                pady=6,
+            ).pack(anchor="w", padx=16, pady=(16, 12))
+            tk.Label(
+                card,
+                text=title,
+                anchor="w",
+                bg=self.COLORS["surface"],
+                fg=self.COLORS["text"],
+                font=("Microsoft YaHei UI", 11, "bold"),
+            ).pack(fill="x", padx=16)
+            tk.Label(
+                card,
+                text=body,
+                anchor="nw",
+                justify="left",
+                wraplength=290,
+                bg=self.COLORS["surface"],
+                fg=self.COLORS["secondary_text"],
+                font=("Microsoft YaHei UI", 9),
+            ).pack(fill="both", expand=True, padx=16, pady=(7, 16))
+
+        tk.Label(
+            self.douyin_page,
             text=(
-                "关键：必须选择里面直接含有 manifest.json 的 emoji-bridge-extension 文件夹；"
-                "不要选择上层 EmojiBridge，也不要把 ZIP 直接拖进 Chrome。"
+                "安装时请选择里面直接含有 manifest.json 的 emoji-bridge-extension "
+                "文件夹，不要选择 ZIP 或它的上层目录。"
             ),
             anchor="w",
             justify="left",
-            wraplength=700,
-            bg=self.COLORS["paper"],
-            fg=self.COLORS["red"],
-            font=("Microsoft YaHei UI", 8, "bold"),
-        ).pack(fill="x", padx=27, pady=(8, 5))
-
-        footer = tk.Frame(dialog, bg=self.COLORS["ink"])
-        footer.pack(fill="x", side="bottom")
-        self.extension_download_button = tk.Button(
-            footer,
-            text="下载 / 更新扩展",
-            command=self._start_extension_download,
-            bd=0,
-            bg=self.COLORS["red"],
-            fg="white",
-            padx=13,
-            pady=10,
-            cursor="hand2",
-            font=("Microsoft YaHei UI", 9, "bold"),
-        )
-        self.extension_download_button.pack(side="left", padx=(18, 5), pady=12)
-        self.extension_open_button = tk.Button(
-            footer,
-            text="打开下载文件夹",
-            command=self._open_downloaded_extension,
-            state="disabled",
-            bd=0,
-            bg=self.COLORS["gold"],
-            fg=self.COLORS["ink"],
-            padx=13,
-            pady=10,
-            cursor="hand2",
-            font=("Microsoft YaHei UI", 9, "bold"),
-        )
-        self.extension_open_button.pack(side="left", padx=5, pady=12)
-        self.extension_copy_button = tk.Button(
-            footer,
-            text="复制文件夹路径",
-            command=self._copy_extension_path,
-            state="disabled",
-            bd=0,
-            bg=self.COLORS["cream"],
-            fg=self.COLORS["ink"],
-            padx=13,
-            pady=10,
-            cursor="hand2",
-            font=("Microsoft YaHei UI", 9),
-        )
-        self.extension_copy_button.pack(side="left", padx=5, pady=12)
-        tk.Button(
-            footer,
-            text="打开 Chrome 扩展页",
-            command=lambda: webbrowser.open("chrome://extensions/"),
-            bd=0,
-            bg=self.COLORS["teal"],
-            fg="white",
-            padx=13,
-            pady=10,
-            cursor="hand2",
-            font=("Microsoft YaHei UI", 9, "bold"),
-        ).pack(side="right", padx=18, pady=12)
-
-        if self.downloaded_extension_dir:
-            self._show_extension_download_success(self.downloaded_extension_dir)
-        if start_download:
-            self._start_extension_download()
-
-    def _close_extension_guide(self) -> None:
-        if self.extension_guide:
-            self.extension_guide.destroy()
-        self.extension_guide = None
-
-    def _start_extension_download(self) -> None:
-        if self.extension_download_running:
-            return
-        self.extension_download_running = True
-        if self.extension_guide and self.extension_guide.winfo_exists():
-            self.extension_status_label.configure(text="正在从 GitHub 下载扩展源码…")
-            self.extension_path_label.configure(text=EXTENSION_ARCHIVE_URL)
-            self.extension_download_button.configure(state="disabled")
-            self.extension_open_button.configure(state="disabled")
-            self.extension_copy_button.configure(state="disabled")
-            self.extension_progress.start(12)
-        threading.Thread(
-            target=self._download_extension_worker,
-            daemon=True,
-        ).start()
-        self.after(100, self._poll_extension_download)
-
-    def _download_extension_worker(self) -> None:
-        temporary_path: Path | None = None
-        try:
-            EXTENSION_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-            file_descriptor, temporary_name = tempfile.mkstemp(
-                prefix=".emoji-bridge-extension-",
-                suffix=".zip",
-                dir=EXTENSION_DOWNLOAD_DIR,
-            )
-            os.close(file_descriptor)
-            temporary_path = Path(temporary_name)
-            request = urllib.request.Request(
-                EXTENSION_ARCHIVE_URL,
-                headers={"User-Agent": "EmojiBridge/1.0"},
-            )
-            downloaded = 0
-            max_download = 100 * 1024 * 1024
-            with urllib.request.urlopen(request, timeout=45) as response:
-                declared = int(response.headers.get("Content-Length") or 0)
-                if declared > max_download:
-                    raise ValueError("仓库压缩包超过 100 MB，已停止下载。")
-                with temporary_path.open("wb") as destination:
-                    while True:
-                        chunk = response.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        downloaded += len(chunk)
-                        if downloaded > max_download:
-                            raise ValueError("仓库压缩包超过 100 MB，已停止下载。")
-                        destination.write(chunk)
-            target = extract_extension_bundle(
-                temporary_path,
-                EXTENSION_DOWNLOAD_DIR,
-            )
-            self.extension_download_queue.put(("success", target))
-        except Exception as error:
-            self.extension_download_queue.put(("error", str(error)))
-        finally:
-            if temporary_path:
-                temporary_path.unlink(missing_ok=True)
-
-    def _poll_extension_download(self) -> None:
-        handled = False
-        while True:
-            try:
-                kind, payload = self.extension_download_queue.get_nowait()
-            except queue.Empty:
-                break
-            handled = True
-            self.extension_download_running = False
-            if kind == "success":
-                self.downloaded_extension_dir = Path(payload)
-                self._show_extension_download_success(self.downloaded_extension_dir)
-            else:
-                self._show_extension_download_error(str(payload))
-        if self.extension_download_running and not handled:
-            self.after(100, self._poll_extension_download)
-
-    def _show_extension_download_success(self, target: Path) -> None:
-        if not self.extension_guide or not self.extension_guide.winfo_exists():
-            return
-        self.extension_progress.stop()
-        self.extension_status_label.configure(text="下载、解压与 manifest 校验已完成。")
-        self.extension_path_label.configure(text=f"安装时请选择：{target}")
-        self.extension_download_button.configure(state="normal")
-        self.extension_open_button.configure(state="normal")
-        self.extension_copy_button.configure(state="normal")
-
-    def _show_extension_download_error(self, error: str) -> None:
-        if not self.extension_guide or not self.extension_guide.winfo_exists():
-            return
-        self.extension_progress.stop()
-        self.extension_status_label.configure(text="扩展下载失败，可以稍后重试。")
-        self.extension_path_label.configure(text=error)
-        self.extension_download_button.configure(state="normal")
-
-    def _open_downloaded_extension(self) -> None:
-        if self.downloaded_extension_dir:
-            self.open_folder(self.downloaded_extension_dir)
-
-    def _copy_extension_path(self) -> None:
-        if not self.downloaded_extension_dir:
-            return
-        self.clipboard_clear()
-        self.clipboard_append(str(self.downloaded_extension_dir))
-        self.update()
-        if self.extension_guide and self.extension_guide.winfo_exists():
-            self.extension_status_label.configure(text="扩展文件夹路径已复制。")
+            bg=self.COLORS["background"],
+            fg=self.COLORS["secondary_text"],
+            font=("Microsoft YaHei UI", 8),
+        ).pack(fill="x", padx=2, pady=(10, 0))
 
     def _paint_source_buttons(self) -> None:
         for name, button in self.source_buttons.items():
             active = name == self.platform
+            normal = self.COLORS["primary"] if active else self.COLORS["control"]
+            hover = (
+                self.COLORS["primary_hover"]
+                if active
+                else self.COLORS["control_hover"]
+            )
+            button._bridge_normal = normal  # type: ignore[attr-defined]
+            button._bridge_hover = hover  # type: ignore[attr-defined]
             button.configure(
-                bg=self.COLORS["red"] if active else self.COLORS["cream"],
-                fg="white" if active else self.COLORS["ink"],
+                bg=normal,
+                activebackground=hover,
+                fg="white" if active else self.COLORS["text"],
+                activeforeground="white" if active else self.COLORS["text"],
             )
 
-    def refresh_sources(self) -> None:
-        self.status.configure(text="正在验证 QQ 与微信数据目录…")
-        self.update_idletasks()
-        try:
-            self.locations["QQ"] = discover_qq_locations(
-                extra_roots=[
-                    Path(path) for path in self.config_data.get("qq_roots", [])
-                ]
-            )
-            self.locations["微信"] = discover_wechat_locations(
-                extra_roots=[
-                    Path(path) for path in self.config_data.get("wechat_roots", [])
-                ]
-            )
-            self.set_platform(self.platform, force=True)
-            self.status.configure(
-                text=(
-                    f"已验证：QQ {len(self.locations['QQ'])} 个账号目录，"
-                    f"微信 {len(self.locations['微信'])} 个账号目录。"
-                )
-            )
-        except Exception as error:
-            self.status.configure(text=f"目录发现失败：{error}")
-
-    def set_platform(self, platform: str, force: bool = False) -> None:
-        if platform == self.platform and not force:
+    def set_platform(self, platform: str) -> None:
+        if platform == self.platform:
             return
         self.platform = platform
-        self._paint_source_buttons()
-        self._update_source_notice()
-        if platform == "抖音网页":
-            root = Path(self.config_data.get("douyin_root", DEFAULT_DOUYIN_DIR))
-            self.location_combo["values"] = [str(root)]
-            self.location_var.set(str(root))
-        elif platform == "微信":
-            root = Path(self.config_data.get("wechat_inbox_root", WECHAT_INBOX_DIR))
-            self.location_combo["values"] = [f"微信接收箱  ·  {root}"]
-            self.location_var.set(f"微信接收箱  ·  {root}")
+        self.qq_page.pack_forget()
+        self.douyin_page.pack_forget()
+        if platform == "QQ":
+            self.qq_page.pack(fill="both", expand=True)
+            if self.locations and not self.assets:
+                self.scan()
         else:
-            values = [
-                f"{item.label}  ·  {item.source}  ·  {item.account_root}"
-                for item in self.locations[platform]
-            ]
-            self.location_combo["values"] = values
-            self.location_var.set(values[0] if values else "")
-        self.scan()
+            self._cancel_preview()
+            self.douyin_page.pack(fill="both", expand=True)
+        self._paint_source_buttons()
+
+    def refresh_sources(self) -> None:
+        if self.discovery_running:
+            return
+        self.discovery_running = True
+        self.discover_button.configure(state="disabled")
+        self.scanned_drives = list_local_drives()
+        drive_text = "、".join(self._display_drive(path) for path in self.scanned_drives)
+        self.status.configure(
+            text=f"正在检查本机磁盘：{drive_text or '未发现可用本地磁盘'}…"
+        )
+        self._drain_queue(self.discovery_queue)
+        extra_roots = [
+            Path(path)
+            for path in self.config_data.get("qq_roots", [])
+            if isinstance(path, str)
+        ]
+        threading.Thread(
+            target=self._discover_qq_worker,
+            args=(self.scanned_drives, extra_roots),
+            daemon=True,
+        ).start()
+        self.after(100, self._poll_discovery)
+
+    def _discover_qq_worker(
+        self,
+        drives: list[Path],
+        extra_roots: list[Path],
+    ) -> None:
+        try:
+            locations = discover_qq_locations(
+                drives=drives,
+                extra_roots=extra_roots,
+            )
+            self.discovery_queue.put(("success", locations))
+        except Exception as error:
+            self.discovery_queue.put(("error", str(error)))
+
+    def _poll_discovery(self) -> None:
+        try:
+            kind, payload = self.discovery_queue.get_nowait()
+        except queue.Empty:
+            if self.discovery_running:
+                self.after(100, self._poll_discovery)
+            return
+
+        self.discovery_running = False
+        self.discover_button.configure(state="normal")
+        if kind == "error":
+            self.status.configure(text=f"QQ 路径发现失败：{payload}")
+            return
+        self.locations = list(payload)  # type: ignore[arg-type]
+        self._populate_locations()
+        if self.platform == "QQ":
+            self.scan()
+
+    def _populate_locations(self) -> None:
+        values = [
+            f"{item.label}  ·  {item.source}  ·  {item.account_root}"
+            for item in self.locations
+        ]
+        self.location_combo["values"] = values
+        if values:
+            self.location_combo.current(0)
+        else:
+            self.location_var.set("")
 
     def _selected_location(self) -> Location | None:
-        if self.platform in ("抖音网页", "微信"):
-            return None
         index = self.location_combo.current()
-        values = self.locations[self.platform]
-        return values[index] if 0 <= index < len(values) else None
-
-    @staticmethod
-    def _scan_douyin_with_samples(root: Path) -> list[Asset]:
-        assets = scan_douyin(root)
-        known = {os.path.normcase(str(asset.path.resolve())) for asset in assets}
-        for sample in PROJECT_ROOT.glob("douyin_*"):
-            if not sample.is_file():
-                continue
-            key = os.path.normcase(str(sample.resolve()))
-            if key in known:
-                continue
-            asset = detect_media(sample, "抖音网页")
-            if asset.readable:
-                assets.append(asset)
-                known.add(key)
-        return sorted(assets, key=lambda asset: asset.modified, reverse=True)
+        return self.locations[index] if 0 <= index < len(self.locations) else None
 
     def scan(self) -> None:
+        if self.platform != "QQ":
+            return
         self._cancel_preview()
-        self.preview.configure(image="", text="正在读取当前来源…")
+        self.preview.configure(image="", text="正在读取 QQ 喜欢表情…")
         self.detail.configure(text="")
         self.preview_image = None
         self.preview_frames = []
@@ -844,47 +854,32 @@ class EmojiBridgeApp(tk.Tk):
         self.thumbnail_images = []
         self.assets = []
         self._refresh_export_button()
+
+        location = self._selected_location()
+        drive_text = "、".join(self._display_drive(path) for path in self.scanned_drives)
+        if location is None:
+            self.preview.configure(image="", text="没有找到 QQ 喜欢表情目录")
+            self.status.configure(
+                text=(
+                    f"已检查 {drive_text or '本机标准位置'}，没有发现有效的 "
+                    "nt_qq\\nt_data\\Emoji；可使用“手动选择”。"
+                )
+            )
+            return
+
         try:
-            if self.platform == "抖音网页":
-                root = Path(self.location_var.get() or DEFAULT_DOUYIN_DIR)
-                self.assets = self._scan_douyin_with_samples(root)
-                path_note = str(root)
-            elif self.platform == "微信":
-                configured = Path(
-                    self.config_data.get("wechat_inbox_root", WECHAT_INBOX_DIR)
-                )
-                self.assets = scan_local_folder(configured, "微信")
-                path_note = f"微信官方导出接收箱 · {configured}"
-                if not self.assets:
-                    self.preview.configure(
-                        image="",
-                        text="微信接收箱为空\n先在微信消息上右键“另存为…”",
-                    )
-                    self.detail.configure(
-                        text=(
-                            "已验证：静态图片消息菜单包含“另存为…”。\n\n"
-                            "未验证：动态收藏表情发送后是否仍提供“另存为…”。\n\n"
-                            f"接收箱：{configured}"
-                        )
-                    )
-            else:
-                location = self._selected_location()
-                if location is None:
-                    self.status.configure(text=f"未自动发现 {self.platform} 目录，请手动选择。")
-                    return
-                self.assets = scan_qq(location)
-                path_note = (
-                    f"QQ · 喜欢 · {location.media_root / 'personal_emoji' / 'Ori'}"
-                )
+            self.assets = scan_qq(location)
             for index, asset in enumerate(self.assets):
                 dimensions = (
                     f"{asset.width}×{asset.height}"
                     if asset.width and asset.height
                     else "—"
                 )
-                animation = f"{asset.frames} 帧" if asset.frames > 1 else ("静态" if asset.readable else "待解密")
-                size = self._format_size(asset.size)
-                modified = datetime.fromtimestamp(asset.modified).strftime("%m-%d %H:%M:%S")
+                animation = (
+                    f"{asset.frames} 帧"
+                    if asset.frames > 1
+                    else ("静态" if asset.readable else "不可识别")
+                )
                 thumbnail = self._make_thumbnail(asset)
                 if thumbnail is not None:
                     self.thumbnail_images.append(thumbnail)
@@ -893,72 +888,76 @@ class EmojiBridgeApp(tk.Tk):
                     "end",
                     iid=str(index),
                     image=thumbnail or "",
-                    text="" if thumbnail else "🔒",
-                    values=(asset.format, dimensions, animation, size, modified),
+                    text="" if thumbnail else "—",
+                    values=(
+                        asset.format,
+                        dimensions,
+                        animation,
+                        self._format_size(asset.size),
+                        datetime.fromtimestamp(asset.modified).strftime(
+                            "%m-%d %H:%M:%S"
+                        ),
+                    ),
                 )
             readable = sum(asset.readable for asset in self.assets)
+            personal_root = location.media_root / "personal_emoji" / "Ori"
             self.status.configure(
-                text=f"{path_note} · 找到 {len(self.assets)} 项，可直接导出 {readable} 项。"
+                text=(
+                    f"已检查 {drive_text or '手动目录'} · {location.label} · "
+                    f"找到 {len(self.assets)} 项，可导出 {readable} 项 · {personal_root}"
+                )
             )
             if self.assets:
                 self.tree.selection_set("0")
                 self.tree.focus("0")
                 self.show_selected()
+            else:
+                self.preview.configure(image="", text="这个 QQ 账号的“喜欢”列表为空")
         except Exception as error:
-            self.status.configure(text=f"扫描失败：{error}")
+            self.status.configure(text=f"QQ 表情扫描失败：{error}")
 
     def choose_folder(self) -> None:
-        chosen = filedialog.askdirectory(title=f"选择 {self.platform} 数据目录")
+        chosen = filedialog.askdirectory(title="选择 QQ 数据目录或它的上层目录")
         if not chosen:
             return
         root = Path(chosen)
-        if self.platform == "抖音网页":
-            self.location_combo["values"] = [str(root)]
-            self.location_var.set(str(root))
-            self.config_data["douyin_root"] = str(root)
-            self._save_config()
-            self.scan()
-            return
-        if self.platform == "微信":
-            self.config_data["wechat_inbox_root"] = str(root)
-            self._save_config()
-            self.set_platform(self.platform, force=True)
-            return
-
-        if self.platform == "QQ":
-            found = discover_qq_locations(drives=[], extra_roots=[root])
-        else:
-            found = discover_wechat_locations(
-                drives=[], process_roots=[], extra_roots=[root]
-            )
+        found = discover_qq_locations(
+            home=root / ".emoji-bridge-validation-home",
+            drives=[],
+            extra_roots=[root],
+        )
         if not found:
             messagebox.showwarning(
                 "目录未通过验证",
-                "所选目录内没有发现该平台的表情缓存结构。可以选择更上层的数据目录。",
+                "所选目录内没有发现 nt_qq\\nt_data\\Emoji。请选择 QQ 数据目录或更上层目录。",
             )
             return
-        key = "qq_roots" if self.platform == "QQ" else "wechat_roots"
-        saved = list(self.config_data.get(key, []))
+        saved = list(self.config_data.get("qq_roots", []))
         normalized = os.path.normcase(str(root.resolve()))
-        if all(os.path.normcase(str(Path(item).resolve())) != normalized for item in saved):
+        if all(
+            os.path.normcase(str(Path(item).resolve())) != normalized
+            for item in saved
+            if isinstance(item, str)
+        ):
             saved.append(str(root))
-            self.config_data[key] = saved
+            self.config_data["qq_roots"] = saved
             self._save_config()
-        self.locations[self.platform] = found
-        self.set_platform(self.platform, force=True)
+        self.refresh_sources()
 
     def show_selected(self, _event: object | None = None) -> None:
         selection = self.tree.selection()
         if not selection:
+            self._refresh_export_button()
             return
         asset = self.assets[int(selection[0])]
         self._show_preview(asset)
         duration = (
-            f"{asset.duration_ms / 1000:.2f} 秒" if asset.duration_ms is not None else "—"
+            f"{asset.duration_ms / 1000:.2f} 秒"
+            if asset.duration_ms is not None
+            else "—"
         )
         self.detail.configure(
             text=(
-                f"来源：{asset.platform}\n"
                 f"真实格式：{asset.format}\n"
                 f"尺寸：{asset.width or '—'} × {asset.height or '—'}\n"
                 f"帧数：{asset.frames or '—'}\n"
@@ -973,29 +972,24 @@ class EmojiBridgeApp(tk.Tk):
         self._cancel_preview()
         self.preview_frames = []
         if not asset.readable:
-            self.preview.configure(
-                image="",
-                text="微信 4.x 加密缓存\n路径已发现，原件尚未解密",
-            )
+            self.preview.configure(image="", text="文件格式无法识别")
             return
         try:
             with Image.open(asset.path) as image:
                 count = min(int(getattr(image, "n_frames", 1)), 80)
+                durations: list[int] = []
                 for index in range(count):
                     image.seek(index)
                     frame = image.convert("RGBA")
                     frame.thumbnail((300, 300), Image.Resampling.LANCZOS)
                     self.preview_frames.append(ImageTk.PhotoImage(frame.copy()))
-                durations = []
-                for index in range(count):
-                    image.seek(index)
                     durations.append(max(40, int(image.info.get("duration", 100))))
             self.preview.configure(text="", image=self.preview_frames[0])
             self.preview_image = self.preview_frames[0]
             if len(self.preview_frames) > 1:
                 self._animate_preview(0, durations)
         except (OSError, ValueError, UnidentifiedImageError):
-            self.preview.configure(image="", text="预览失败，但原始文件仍可导出。")
+            self.preview.configure(image="", text="预览失败，但原件仍可导出")
 
     def _make_thumbnail(self, asset: Asset) -> ImageTk.PhotoImage | None:
         if not asset.readable:
@@ -1005,10 +999,11 @@ class EmojiBridgeApp(tk.Tk):
                 image.seek(0)
                 frame = image.convert("RGBA")
                 frame.thumbnail((64, 64), Image.Resampling.LANCZOS)
-                tile = Image.new("RGBA", (68, 68), self.COLORS["cream"])
-                x = (68 - frame.width) // 2
-                y = (68 - frame.height) // 2
-                tile.alpha_composite(frame, (x, y))
+                tile = Image.new("RGBA", (68, 68), self.COLORS["surface"])
+                tile.alpha_composite(
+                    frame,
+                    ((68 - frame.width) // 2, (68 - frame.height) // 2),
+                )
                 return ImageTk.PhotoImage(tile.convert("RGB"))
         except (OSError, ValueError, UnidentifiedImageError):
             return None
@@ -1019,7 +1014,10 @@ class EmojiBridgeApp(tk.Tk):
         self.preview_image = frame
         delay = durations[index % len(durations)]
         self.preview_job = self.after(
-            delay, self._animate_preview, (index + 1) % len(self.preview_frames), durations
+            delay,
+            self._animate_preview,
+            (index + 1) % len(self.preview_frames),
+            durations,
         )
 
     def _cancel_preview(self) -> None:
@@ -1028,37 +1026,23 @@ class EmojiBridgeApp(tk.Tk):
             self.preview_job = None
 
     def export_selected(self) -> None:
-        selection = self.tree.selection()
-        if not selection:
-            return
         selected_assets = [
             self.assets[int(item)]
-            for item in selection
-            if self.assets[int(item)].readable
+            for item in self.tree.selection()
+            if int(item) < len(self.assets) and self.assets[int(item)].readable
         ]
         if not selected_assets:
             return
         try:
-            wechat_mode = self.target_var.get() == "微信兼容版"
-            output_dir = LIBRARY_DIR / "wechat-ready" if wechat_mode else LIBRARY_DIR
-            targets = [
-                (
-                    prepare_for_wechat(asset, output_dir)
-                    if wechat_mode
-                    else export_asset(asset, output_dir)
-                )
-                for asset in selected_assets
-            ]
-            self.status.configure(text=f"已校验并生成 {len(targets)} 项到：{output_dir}")
+            targets = [export_asset(asset, LIBRARY_DIR) for asset in selected_assets]
+            self.status.configure(
+                text=f"已复制并校验 {len(targets)} 项到：{LIBRARY_DIR}"
+            )
             messagebox.showinfo(
                 "已进入本地表情库",
                 (
-                    f"已生成 {len(targets)} 项。\n\n"
-                    + (
-                        "请用微信的图片入口或直接拖入聊天，再添加为表情。"
-                        if wechat_mode
-                        else "现在可发送到 QQ 或抖音。"
-                    )
+                    f"已导出 {len(targets)} 项。\n\n"
+                    "可发送到 QQ 的“我的电脑”或任意私聊，再收藏为表情。"
                 ),
             )
         except Exception as error:
@@ -1082,15 +1066,265 @@ class EmojiBridgeApp(tk.Tk):
             for item in self.tree.selection()
             if int(item) < len(self.assets)
         )
-        action = (
-            "生成微信兼容版"
-            if self.target_var.get() == "微信兼容版"
-            else "复制原件到表情库"
-        )
+        enabled = readable_selected > 0
         self.export_button.configure(
-            state="normal" if readable_selected else "disabled",
-            text=f"{action} · {readable_selected} 项",
+            state="normal" if enabled else "disabled",
+            text=f"复制原件到表情库 · {readable_selected} 项",
+            bg=self.COLORS["primary"] if enabled else self.COLORS["control"],
+            fg="white" if enabled else self.COLORS["tertiary_text"],
         )
+
+    def _start_extension_download(self) -> None:
+        if self.extension_download_running:
+            return
+        self.extension_download_running = True
+        self._drain_queue(self.extension_download_queue)
+        self.extension_status_label.configure(
+            text="正在准备当前版本扩展…",
+            fg=self.COLORS["text"],
+        )
+        self.extension_path_label.configure(
+            text=str(PROJECT_ROOT / "emoji-bridge-extension")
+        )
+        self.extension_download_button.configure(state="disabled")
+        self.extension_open_button.configure(state="disabled")
+        self.extension_copy_button.configure(state="disabled")
+        self.extension_progress.stop()
+        self.extension_progress.configure(mode="indeterminate", value=0)
+        self.extension_progress.pack(fill="x", padx=16, pady=(0, 8))
+        self.extension_progress.start(12)
+        threading.Thread(
+            target=self._download_extension_worker,
+            daemon=True,
+        ).start()
+        self.after(100, self._poll_extension_download)
+
+    def _download_extension_worker(self) -> None:
+        temporary_path: Path | None = None
+        try:
+            bundled = PROJECT_ROOT / "emoji-bridge-extension"
+            if (bundled / "manifest.json").is_file():
+                self.extension_download_queue.put(("local-start", bundled))
+
+                def report(copied: int, total: int) -> None:
+                    self.extension_download_queue.put(
+                        (
+                            "progress",
+                            {
+                                "downloaded": copied,
+                                "total": total,
+                                "operation": "正在复制项目内置扩展",
+                            },
+                        )
+                    )
+
+                target = copy_extension_bundle(
+                    bundled,
+                    EXTENSION_DOWNLOAD_DIR,
+                    progress=report,
+                )
+                self.extension_download_queue.put(("success", target))
+                return
+
+            EXTENSION_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+            file_descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".emoji-bridge-extension-",
+                suffix=".zip",
+                dir=EXTENSION_DOWNLOAD_DIR,
+            )
+            os.close(file_descriptor)
+            temporary_path = Path(temporary_name)
+            request = urllib.request.Request(
+                EXTENSION_ARCHIVE_URL,
+                headers={"User-Agent": "EmojiBridge/1.0"},
+            )
+            downloaded = 0
+            max_download = 100 * 1024 * 1024
+            with urllib.request.urlopen(request, timeout=45) as response:
+                declared = int(response.headers.get("Content-Length") or 0)
+                if declared > max_download:
+                    raise ValueError("仓库压缩包超过 100 MB，已停止下载。")
+                self.extension_download_queue.put(
+                    ("download-start", {"total": declared})
+                )
+                with temporary_path.open("wb") as destination:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        downloaded += len(chunk)
+                        if downloaded > max_download:
+                            raise ValueError("仓库压缩包超过 100 MB，已停止下载。")
+                        destination.write(chunk)
+                        self.extension_download_queue.put(
+                            (
+                                "progress",
+                                {
+                                    "downloaded": downloaded,
+                                    "total": declared,
+                                    "operation": "正在下载扩展源码",
+                                },
+                            )
+                        )
+            self.extension_download_queue.put(("extracting", downloaded))
+            target = extract_extension_bundle(
+                temporary_path,
+                EXTENSION_DOWNLOAD_DIR,
+            )
+            self.extension_download_queue.put(("success", target))
+        except Exception as error:
+            self.extension_download_queue.put(("error", str(error)))
+        finally:
+            if temporary_path:
+                temporary_path.unlink(missing_ok=True)
+
+    def _poll_extension_download(self) -> None:
+        while True:
+            try:
+                kind, payload = self.extension_download_queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "download-start":
+                total = int(payload["total"])  # type: ignore[index]
+                if total > 0:
+                    self.extension_progress.stop()
+                    self.extension_progress.configure(mode="determinate", value=0)
+                    self.extension_status_label.configure(text="正在下载扩展源码 · 0%")
+                else:
+                    self.extension_status_label.configure(
+                        text="正在下载扩展源码 · 服务器未提供总大小"
+                    )
+            elif kind == "local-start":
+                self.extension_progress.stop()
+                self.extension_progress.configure(mode="determinate", value=0)
+                self.extension_status_label.configure(text="正在复制项目内置扩展 · 0%")
+                self.extension_path_label.configure(text=str(payload))
+            elif kind == "progress":
+                downloaded = int(payload["downloaded"])  # type: ignore[index]
+                total = int(payload["total"])  # type: ignore[index]
+                operation = str(payload.get("operation", "正在处理扩展"))  # type: ignore[union-attr]
+                if total > 0:
+                    percent = min(100, downloaded * 100 / total)
+                    self.extension_progress.configure(value=percent)
+                    self.extension_status_label.configure(
+                        text=(
+                            f"{operation} · {percent:.0f}% · "
+                            f"{self._format_size(downloaded)} / {self._format_size(total)}"
+                        )
+                    )
+                else:
+                    self.extension_status_label.configure(
+                        text=f"{operation} · 已处理 {self._format_size(downloaded)}"
+                    )
+            elif kind == "extracting":
+                self.extension_progress.stop()
+                self.extension_progress.configure(mode="indeterminate")
+                self.extension_progress.start(12)
+                self.extension_status_label.configure(
+                    text=(
+                        f"下载完成（{self._format_size(int(payload))}），"
+                        "正在解压并验证 manifest…"
+                    )
+                )
+            elif kind == "success":
+                self.extension_download_running = False
+                self.downloaded_extension_dir = Path(payload)
+                self._show_extension_download_success(self.downloaded_extension_dir)
+            elif kind == "error":
+                self.extension_download_running = False
+                self._show_extension_download_error(str(payload))
+        if self.extension_download_running:
+            self.after(100, self._poll_extension_download)
+
+    def _show_extension_download_success(self, target: Path) -> None:
+        self.extension_progress.stop()
+        self.extension_progress.pack_forget()
+        self.extension_status_label.configure(
+            text="扩展准备与 manifest 校验已完成。",
+            fg=self.COLORS["success"],
+        )
+        self.extension_path_label.configure(text=f"安装时选择：{target}")
+        self.extension_download_button.configure(state="normal")
+        self.extension_open_button.configure(state="normal")
+        self.extension_copy_button.configure(state="normal")
+
+    def _show_extension_download_error(self, error: str) -> None:
+        self.extension_progress.stop()
+        self.extension_progress.pack_forget()
+        self.extension_status_label.configure(
+            text="扩展下载失败，可以稍后重试。",
+            fg=self.COLORS["error"],
+        )
+        self.extension_path_label.configure(text=error)
+        self.extension_download_button.configure(state="normal")
+        self.extension_open_button.configure(state="disabled")
+        self.extension_copy_button.configure(state="disabled")
+
+    def _open_downloaded_extension(self) -> None:
+        if self.downloaded_extension_dir:
+            self.open_folder(self.downloaded_extension_dir)
+
+    def _open_extension_page(self) -> None:
+        self.clipboard_clear()
+        self.clipboard_append(CHROME_EXTENSIONS_URL)
+        self.update()
+        if find_chrome_executable() is None:
+            messagebox.showwarning(
+                "扩展页地址已复制",
+                "没有找到可启动的 Google Chrome。\n\n"
+                "请手动打开 Chrome，在地址栏按 Ctrl+V，再按 Enter。",
+                parent=self,
+            )
+            return
+        messagebox.showinfo(
+            "扩展页地址已复制",
+            "Chrome 不允许外部程序直接打开内部扩展页。\n\n"
+            "点击“确定”后会打开 Chrome；请在地址栏按 Ctrl+V，"
+            "再按 Enter。",
+            parent=self,
+        )
+        if not launch_chrome():
+            messagebox.showwarning(
+                "无法启动 Chrome",
+                "扩展页地址仍在剪贴板中。\n\n"
+                "请手动打开 Chrome，在地址栏按 Ctrl+V，再按 Enter。",
+                parent=self,
+            )
+
+    def _copy_extension_path(self) -> None:
+        if not self.downloaded_extension_dir:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(str(self.downloaded_extension_dir))
+        self.update()
+        self.extension_status_label.configure(
+            text="扩展文件夹路径已复制。",
+            fg=self.COLORS["success"],
+        )
+
+    @staticmethod
+    def _find_existing_extension() -> Path | None:
+        if not EXTENSION_DOWNLOAD_DIR.is_dir():
+            return None
+        candidates: list[Path] = []
+        for path in EXTENSION_DOWNLOAD_DIR.glob("emoji-bridge-extension*"):
+            if path.is_dir() and (path / "manifest.json").is_file():
+                candidates.append(path)
+        if not candidates:
+            return None
+        return max(candidates, key=lambda path: path.stat().st_mtime)
+
+    @staticmethod
+    def _display_drive(path: Path) -> str:
+        return path.drive or path.name or str(path)
+
+    @staticmethod
+    def _drain_queue(target: queue.Queue[tuple[str, object]]) -> None:
+        while True:
+            try:
+                target.get_nowait()
+            except queue.Empty:
+                return
 
     @staticmethod
     def _format_size(size: int) -> str:
@@ -1114,9 +1348,16 @@ class EmojiBridgeApp(tk.Tk):
     def _load_config() -> dict:
         try:
             data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
         except (OSError, json.JSONDecodeError):
             return {}
+        if not isinstance(data, dict):
+            return {}
+        qq_roots = data.get("qq_roots", [])
+        return {
+            "qq_roots": [item for item in qq_roots if isinstance(item, str)]
+            if isinstance(qq_roots, list)
+            else []
+        }
 
     def _save_config(self) -> None:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)

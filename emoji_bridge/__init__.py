@@ -3,25 +3,21 @@
 from .core import (
     Asset,
     Location,
+    copy_extension_bundle,
     detect_media,
     discover_qq_locations,
-    discover_wechat_locations,
     export_asset,
-    prepare_for_wechat,
-    scan_douyin,
+    list_local_drives,
     scan_qq,
-    scan_wechat,
 )
 
 __all__ = [
     "Asset",
     "Location",
+    "copy_extension_bundle",
     "detect_media",
     "discover_qq_locations",
-    "discover_wechat_locations",
     "export_asset",
-    "prepare_for_wechat",
-    "scan_douyin",
+    "list_local_drives",
     "scan_qq",
-    "scan_wechat",
 ]

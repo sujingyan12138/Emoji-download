@@ -10,12 +10,12 @@
     open: false,
     scanning: false,
     assets: [],
-    destination: "wechat",
     dragMoved: false,
     suppressLauncherClick: false
   };
   const drag = {
     active: false,
+    source: null,
     offsetX: 0,
     offsetY: 0,
     startX: 0,
@@ -40,15 +40,15 @@
         <button class="eb-icon-button eb-close" type="button" aria-label="关闭">×</button>
       </header>
 
-      <section class="eb-route" aria-label="迁移路线">
+      <section class="eb-route" aria-label="整理路线">
         <div class="eb-route__source">
           <span class="eb-route__label">来源</span>
           <strong>抖音网页</strong>
         </div>
         <span class="eb-route__arrow" aria-hidden="true">→</span>
-        <div class="eb-destination" role="group" aria-label="目标平台">
-          <button type="button" class="is-active" data-destination="wechat">微信</button>
-          <button type="button" data-destination="qq">QQ</button>
+        <div class="eb-route__target">
+          <span class="eb-route__label">整理到</span>
+          <strong>QQ 表情</strong>
         </div>
       </section>
 
@@ -79,7 +79,7 @@
         <span class="eb-ticket-notch eb-ticket-notch--right"></span>
         <p class="eb-handoff__kicker">下载后的下一站</p>
         <p class="eb-handoff__copy">
-          发到微信文件传输助手，手机长按图片后选择“添加到表情”。
+          发到 QQ 的“我的电脑”或任意私聊，再把图片收藏为表情。
         </p>
       </section>
 
@@ -107,7 +107,6 @@
   const downloadButton = root.querySelector(".eb-download");
   const downloadCount = root.querySelector(".eb-download-count");
   const openDownloadsButton = root.querySelector(".eb-open-downloads");
-  const handoffCopy = root.querySelector(".eb-handoff__copy");
 
   launcher.addEventListener("click", () => {
     if (state.suppressLauncherClick) {
@@ -127,19 +126,6 @@
   selectAllButton.addEventListener("click", toggleSelectAll);
   downloadButton.addEventListener("click", downloadSelected);
   openDownloadsButton.addEventListener("click", openDownloads);
-
-  root.querySelectorAll("[data-destination]").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.destination = button.dataset.destination;
-      root.querySelectorAll("[data-destination]").forEach((option) => {
-        option.classList.toggle("is-active", option === button);
-      });
-      handoffCopy.textContent =
-        state.destination === "wechat"
-          ? "发到微信文件传输助手，手机长按图片后选择“添加到表情”。"
-          : "发到 QQ 的“我的电脑”或任意私聊，再把图片收藏为表情。";
-    });
-  });
 
   chrome.runtime.onMessage.addListener((message) => {
     if (message?.type === "TOGGLE_PANEL") {
@@ -342,6 +328,7 @@
 
     const rect = root.getBoundingClientRect();
     drag.active = true;
+    drag.source = event.currentTarget;
     drag.offsetX = event.clientX - rect.left;
     drag.offsetY = event.clientY - rect.top;
     drag.startX = event.clientX;
@@ -368,8 +355,10 @@
     if (!drag.active) return;
     drag.active = false;
     root.classList.remove("is-dragging");
+    const draggedLauncher = drag.source === launcher;
+    drag.source = null;
     if (!state.dragMoved) return;
-    state.suppressLauncherClick = true;
+    state.suppressLauncherClick = draggedLauncher;
     const rect = root.getBoundingClientRect();
     chrome.storage.local.set({
       [POSITION_STORAGE_KEY]: {
@@ -382,19 +371,22 @@
   function applyPosition(left, top) {
     const rect = root.getBoundingClientRect();
     const margin = 8;
-    const width = Math.min(rect.width || 430, window.innerWidth - margin * 2);
-    const height = Math.min(rect.height || 60, window.innerHeight - margin * 2);
-    const nextLeft = Math.min(
-      Math.max(margin, left),
-      Math.max(margin, window.innerWidth - width - margin)
-    );
-    const nextTop = Math.min(
-      Math.max(margin, top),
-      Math.max(margin, window.innerHeight - height - margin)
-    );
+    const dragHandle = state.open ? header : launcher;
+    const handleRect = dragHandle.getBoundingClientRect();
+    const position = Core.clampFloatingPosition({
+      left,
+      top,
+      visibleWidth: state.open
+        ? rect.width || 430
+        : handleRect.width || 60,
+      visibleHeight: handleRect.height || 60,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+      margin
+    });
     root.style.right = "auto";
-    root.style.left = `${Math.round(nextLeft)}px`;
-    root.style.top = `${Math.round(nextTop)}px`;
+    root.style.left = `${Math.round(position.left)}px`;
+    root.style.top = `${Math.round(position.top)}px`;
   }
 
   function clampCurrentPosition() {

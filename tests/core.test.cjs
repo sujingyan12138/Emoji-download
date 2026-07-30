@@ -153,4 +153,74 @@ test("launcher and panel header support persisted pointer dragging", () => {
   assert.match(extensionContent, /header\.addEventListener\("pointerdown", beginDrag\)/);
   assert.match(extensionContent, /emojiBridgePositionV1/);
   assert.match(extensionContent, /chrome\.storage\.local\.set/);
+  assert.match(extensionContent, /visibleHeight:\s*handleRect\.height/);
+  assert.match(extensionContent, /visibleWidth:\s*state\.open/);
+});
+
+test("expanded panel can move down while keeping its drag handle visible", () => {
+  const position = Core.clampFloatingPosition({
+    left: 700,
+    top: 600,
+    visibleWidth: 430,
+    visibleHeight: 100,
+    viewportWidth: 1200,
+    viewportHeight: 800,
+    margin: 8
+  });
+
+  assert.deepEqual(position, { left: 700, top: 600 });
+  assert.equal(
+    Core.clampFloatingPosition({
+      left: 700,
+      top: 900,
+      visibleWidth: 430,
+      visibleHeight: 100,
+      viewportWidth: 1200,
+      viewportHeight: 800,
+      margin: 8
+    }).top,
+    692
+  );
+});
+
+test("floating extension remains recoverable at every viewport edge", () => {
+  assert.deepEqual(
+    Core.clampFloatingPosition({
+      left: -500,
+      top: -500,
+      visibleWidth: 430,
+      visibleHeight: 100,
+      viewportWidth: 1200,
+      viewportHeight: 800,
+      margin: 8
+    }),
+    { left: 8, top: 8 }
+  );
+  assert.deepEqual(
+    Core.clampFloatingPosition({
+      left: 5000,
+      top: 5000,
+      visibleWidth: 430,
+      visibleHeight: 100,
+      viewportWidth: 1200,
+      viewportHeight: 800,
+      margin: 8
+    }),
+    { left: 762, top: 692 }
+  );
+});
+
+test("collapsed launcher can reach the right edge without hidden panel width blocking it", () => {
+  assert.equal(
+    Core.clampFloatingPosition({
+      left: 5000,
+      top: 100,
+      visibleWidth: 113,
+      visibleHeight: 63,
+      viewportWidth: 1200,
+      viewportHeight: 800,
+      margin: 8
+    }).left,
+    1079
+  );
 });

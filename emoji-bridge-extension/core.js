@@ -231,6 +231,43 @@
     return `${(size / 1024 / 1024).toFixed(1)} MB`;
   }
 
+  function clampFloatingPosition({
+    left,
+    top,
+    visibleWidth,
+    visibleHeight,
+    viewportWidth,
+    viewportHeight,
+    margin = 8
+  }) {
+    const safeMargin = Math.max(0, Number(margin) || 0);
+    const safeViewportWidth = Math.max(0, Number(viewportWidth) || 0);
+    const safeViewportHeight = Math.max(0, Number(viewportHeight) || 0);
+    const availableWidth = Math.max(0, safeViewportWidth - safeMargin * 2);
+    const availableHeight = Math.max(0, safeViewportHeight - safeMargin * 2);
+    const requiredWidth = Math.min(
+      Math.max(0, Number(visibleWidth) || 0),
+      availableWidth
+    );
+    const requiredVisibleHeight = Math.min(
+      Math.max(0, Number(visibleHeight) || 0),
+      availableHeight
+    );
+    const maxLeft = Math.max(
+      safeMargin,
+      safeViewportWidth - requiredWidth - safeMargin
+    );
+    const maxTop = Math.max(
+      safeMargin,
+      safeViewportHeight - requiredVisibleHeight - safeMargin
+    );
+
+    return {
+      left: Math.min(Math.max(safeMargin, Number(left) || 0), maxLeft),
+      top: Math.min(Math.max(safeMargin, Number(top) || 0), maxTop)
+    };
+  }
+
   return {
     MAX_ASSET_BYTES,
     canonicalAssetKey,
@@ -239,6 +276,7 @@
     detectMediaInfo,
     sanitizeFilename,
     buildFilename,
-    formatBytes
+    formatBytes,
+    clampFloatingPosition
   };
 });
