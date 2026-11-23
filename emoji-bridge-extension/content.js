@@ -6,8 +6,10 @@
 
   const Core = EmojiBridgeCore;
   const POSITION_STORAGE_KEY = "emojiBridgePositionV1";
+  const HIDDEN_STORAGE_KEY = "emojiBridgeHiddenV1";
   const state = {
     open: false,
+    hidden: false,
     scanning: false,
     assets: [],
     dragMoved: false,
@@ -26,27 +28,35 @@
   root.id = "emoji-bridge-root";
   root.setAttribute("aria-label", "表情中转站");
   root.innerHTML = `
-    <button class="eb-launcher" type="button" aria-label="打开表情中转站">
+    <button class="eb-launcher" type="button" aria-label="打开表情中转站" title="表情中转站">
       <span class="eb-launcher__stamp">转</span>
-      <span class="eb-launcher__copy">表情<br>中转站</span>
     </button>
     <aside class="eb-panel" aria-hidden="true">
       <header class="eb-header">
-        <div>
-          <p class="eb-eyebrow">EMOJI TRANSFER DESK · 01</p>
-          <h2>表情中转站</h2>
-          <p class="eb-subtitle">从网页原件出发，不截图，不压扁动图。</p>
+        <div class="eb-brand">
+          <span class="eb-brand__mark">转</span>
+          <div class="eb-brand__text">
+            <h2>表情中转站</h2>
+            <p class="eb-subtitle">抓取网页原始表情 · 不截图不压动图</p>
+          </div>
         </div>
-        <button class="eb-icon-button eb-close" type="button" aria-label="关闭">×</button>
+        <div class="eb-tools">
+          <button class="eb-tool eb-close" type="button" aria-label="收起面板" title="收起面板">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+          </button>
+          <button class="eb-tool eb-hide" type="button" aria-label="隐藏悬浮窗" title="隐藏悬浮窗，可从右侧标签恢复">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3l18 18"/><path d="M10.6 5.1A10.9 10.9 0 0 1 12 5c5 0 9 4 9 7 0 1-.6 2.1-1.7 3.2"/><path d="M6.1 6.6C3.9 8.1 3 10.1 3 12c0 3 4 7 9 7 1.2 0 2.4-.2 3.4-.7"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>
+          </button>
+        </div>
       </header>
 
       <section class="eb-route" aria-label="整理路线">
-        <div class="eb-route__source">
+        <div class="eb-route__box eb-route__box--from">
           <span class="eb-route__label">来源</span>
           <strong>抖音网页</strong>
         </div>
         <span class="eb-route__arrow" aria-hidden="true">→</span>
-        <div class="eb-route__target">
+        <div class="eb-route__box eb-route__box--to">
           <span class="eb-route__label">整理到</span>
           <strong>QQ 表情</strong>
         </div>
@@ -74,21 +84,18 @@
         <div class="eb-grid"></div>
       </section>
 
-      <section class="eb-handoff">
-        <span class="eb-ticket-notch eb-ticket-notch--left"></span>
-        <span class="eb-ticket-notch eb-ticket-notch--right"></span>
-        <p class="eb-handoff__kicker">下载后的下一站</p>
-        <p class="eb-handoff__copy">
-          发到 QQ 的“我的电脑”或任意私聊，再把图片收藏为表情。
-        </p>
-      </section>
-
       <footer class="eb-footer">
-        <button class="eb-download" type="button" disabled>
-          下载选中 <span class="eb-download-count">0</span>
-        </button>
-        <button class="eb-open-downloads" type="button">打开下载文件夹</button>
-        <p>文件保存到浏览器下载目录的 <code>EmojiBridge</code> 文件夹。</p>
+        <div class="eb-tip">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v10"/><path d="M7.5 8.5L12 13l4.5-4.5"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
+          <p>下载后发到 QQ 的「我的电脑」，长按图片收藏为表情。</p>
+        </div>
+        <div class="eb-footer__actions">
+          <button class="eb-download" type="button" disabled>
+            下载选中 <span class="eb-download-count">0</span>
+          </button>
+          <button class="eb-open-downloads" type="button">打开下载文件夹</button>
+        </div>
+        <p class="eb-footer__hint">保存到浏览器下载目录的 <code>EmojiBridge</code> 文件夹</p>
       </footer>
     </aside>
   `;
@@ -98,6 +105,7 @@
   const panel = root.querySelector(".eb-panel");
   const header = root.querySelector(".eb-header");
   const closeButton = root.querySelector(".eb-close");
+  const hideButton = root.querySelector(".eb-hide");
   const scanButton = root.querySelector(".eb-scan");
   const selectAllButton = root.querySelector(".eb-select-all");
   const grid = root.querySelector(".eb-grid");
@@ -113,6 +121,11 @@
       state.suppressLauncherClick = false;
       return;
     }
+    if (state.hidden) {
+      setHidden(false);
+      setPanelOpen(true);
+      return;
+    }
     setPanelOpen(!state.open);
   });
   launcher.addEventListener("pointerdown", beginDrag);
@@ -122,6 +135,10 @@
   window.addEventListener("pointercancel", endDrag, true);
   window.addEventListener("resize", clampCurrentPosition);
   closeButton.addEventListener("click", () => setPanelOpen(false));
+  hideButton.addEventListener("click", () => setHidden(true));
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && state.open) setPanelOpen(false);
+  });
   scanButton.addEventListener("click", scanCurrentConversation);
   selectAllButton.addEventListener("click", toggleSelectAll);
   downloadButton.addEventListener("click", downloadSelected);
@@ -129,16 +146,38 @@
 
   chrome.runtime.onMessage.addListener((message) => {
     if (message?.type === "TOGGLE_PANEL") {
-      setPanelOpen(!state.open);
+      if (state.hidden) {
+        setHidden(false);
+        setPanelOpen(true);
+      } else {
+        setPanelOpen(!state.open);
+      }
     }
   });
   restorePosition();
+  restoreHiddenState();
 
   function setPanelOpen(open) {
     state.open = Boolean(open);
     panel.classList.toggle("is-open", state.open);
     launcher.classList.toggle("is-hidden", state.open);
     panel.setAttribute("aria-hidden", String(!state.open));
+  }
+
+  function setHidden(hidden) {
+    state.hidden = Boolean(hidden);
+    if (state.hidden) setPanelOpen(false);
+    root.classList.toggle("is-away", state.hidden);
+    chrome.storage.local.set({ [HIDDEN_STORAGE_KEY]: state.hidden });
+  }
+
+  function restoreHiddenState() {
+    chrome.storage.local.get(HIDDEN_STORAGE_KEY, (result) => {
+      if (result?.[HIDDEN_STORAGE_KEY]) {
+        state.hidden = true;
+        root.classList.add("is-away");
+      }
+    });
   }
 
   async function scanCurrentConversation() {

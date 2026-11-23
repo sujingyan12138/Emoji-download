@@ -1,8 +1,14 @@
 {
   "manifest_version": 3,
   "name": "表情中转站 Emoji Bridge",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "从抖音网页版识别并导出原始静态、动态表情，用于整理到 QQ。",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "permissions": [
     "downloads",
     "storage"
@@ -15,7 +21,13 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "打开表情中转站"
+    "default_title": "打开表情中转站",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
   "content_scripts": [
     {
