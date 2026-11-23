@@ -22,3 +22,6 @@ qq_*.jpg
 *.tmp
 Thumbs.db
 .DS_Store
+
+# IDE / editor settings
+.idea/
